@@ -1,0 +1,32 @@
+import pandas as pd
+import os
+
+order_items = pd.read_csv("data/order_items.csv", dtype={"promo_id_2": "string"})
+orders = pd.read_csv("data/orders.csv")
+customers = pd.read_csv("data/customers.csv")
+
+# Parse dates rõ ràng
+orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
+customers["signup_date"] = pd.to_datetime(customers["signup_date"], errors="coerce")
+
+print("orders range:", orders["order_date"].min(), orders["order_date"].max())
+print("orders years:")
+print(orders["order_date"].dt.year.value_counts().sort_index())
+
+# Merge lại
+df_2 = order_items.merge(orders, on="order_id", how="left")
+df_2 = df_2.merge(customers, on="customer_id", how="left", suffixes=("_order", "_customer"))
+
+print("\ndf_2 shape:", df_2.shape)
+print("df_2 order_date range:", df_2["order_date"].min(), df_2["order_date"].max())
+print("df_2 order years:")
+print(df_2["order_date"].dt.year.value_counts().sort_index())
+
+print("\ndf_2 signup years:")
+print(df_2["signup_date"].dt.year.value_counts().sort_index())
+
+print("\nMissing order_date:", df_2["order_date"].isna().sum())
+
+# Save lại file mới để tránh đọc nhầm file cũ
+os.makedirs("output_data", exist_ok=True)
+df_2.to_csv("output_data/df_2_FIXED.csv", index=False, encoding="utf-8-sig")
