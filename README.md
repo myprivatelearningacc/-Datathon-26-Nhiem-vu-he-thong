@@ -41,6 +41,25 @@ Mục tiêu cuối cùng là tạo ra insight kinh doanh có thể hành động
 │   ├── time_series_cv_predictions.csv
 │   ├── lgbm_feature_importance_gain.csv
 │   ├── shap_feature_importance.csv
+│   │
+│   ├── figures/                           # SHAP plots cho model interpretability
+│   │   ├── hybrid_cogs_residual_shap_bar.png
+│   │   ├── hybrid_cogs_residual_shap_beeswarm.png
+│   │   ├── hybrid_revenue_residual_shap_bar.png
+│   │   ├── hybrid_revenue_residual_shap_beeswarm.png
+│   │   ├── pure_cogs_shap_bar.png
+│   │   ├── pure_cogs_shap_beeswarm.png
+│   │   ├── pure_revenue_shap_bar.png
+│   │   └── pure_revenue_shap_beeswarm.png
+│   │
+│   └── plots/                             # Plots đánh giá model và forecast
+│       ├── cv_actual_vs_pred_cogs.png
+│       ├── cv_actual_vs_pred_revenue.png
+│       ├── cv_mae_by_fold.png
+│       ├── cv_scatter_cogs.png
+│       ├── cv_scatter_revenue.png
+│       ├── final_forecast_cogs.png
+│       └── final_forecast_revenue.png
 │
 ├── datathon_mcas.py                       # File Python chính / utility script của project
 └── README.md
