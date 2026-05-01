@@ -18,9 +18,6 @@ Mục tiêu cuối cùng là tạo ra insight kinh doanh có thể hành động
 
 ```text
 
-## Cấu Trúc Dự Án
-
-```text
 ├── EDA/                                  # Jupyter notebooks cho phân tích EDA
 │   ├── EDA_inventory_returns.ipynb        # EDA về inventory và returns
 │   ├── datathon_df1_eda.py                # EDA cho df_1: Revenue & Profit
@@ -48,7 +45,7 @@ Mục tiêu cuối cùng là tạo ra insight kinh doanh có thể hành động
 ├── datathon_mcas.py                       # File Python chính / utility script của project
 └── README.md
 
-```markdown
+```
 
 Mô Tả Dữ Liệu
 
