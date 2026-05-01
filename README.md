@@ -63,7 +63,7 @@ Mục tiêu cuối cùng là tạo ra insight kinh doanh có thể hành động
 │       ├── final_forecast_cogs.png
 │       └── final_forecast_revenue.png
 │
-├── datathon_mcas.py                       # File Python chính / utility script của project
+├── datathon_mcas.py                      
 └── README.md
 
 ```
