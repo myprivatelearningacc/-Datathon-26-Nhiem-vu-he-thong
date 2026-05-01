@@ -1,0 +1,2288 @@
+---
+title: "EDA TRUC 3"
+output: html_document
+date: "2026-04-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(error = TRUE)
+```
+
+# A. Data Wrangling
+
+```{r setup 2, include = FALSE}
+library(tidyverse)      
+library(data.table)     
+library(scales)        
+library(corrplot)       
+library(ggridges)      
+library(patchwork)      
+library(ggstatsplot) 
+library(effectsize)     
+library(rstatix)        
+library(broom)          
+library(caret)          
+library(ranger)         
+library(xgboost)        
+library(iml)           
+library(marginaleffects)
+
+
+df_3 <- read.csv("D:/Downloads/Datathon/df_3.csv")
+
+
+df_3 <- df_3 %>%
+  mutate(
+    order_source = ifelse(order_source == "paid_se", "paid_search", order_source),
+    # Time & Seasonality
+    order_date = as.Date(order_date),
+    year       = year(order_date),
+    month      = month(order_date),
+    quarter    = quarter(order_date),
+    season     = case_when(
+      month %in% 3:5  ~ "Spring",
+      month %in% 6:8  ~ "Mid-Year",
+      month %in% 9:11 ~ "Fall",
+      TRUE            ~ "Year-End"
+    ),
+    
+    # Promo Flags
+    has_promo   = as.factor(ifelse(is.na(promo_id) | promo_id == "", 0, 1)),
+    is_stacked  = as.factor(ifelse(is.na(promo_id_2) | promo_id_2 == "", 0, 1)),
+    is_returned = as.factor(ifelse(order_status == "returned", 1, 0)),
+    
+    # Financial Metrics
+    # Gross revenue
+    gross_revenue = price * quantity, 
+    
+    # Discount Rate
+    discount_rate = ifelse(gross_revenue > 0, discount_amount / gross_revenue, 0),
+    
+    # Gross Margin
+    Total_COGS   = quantity * cogs,
+    gross_margin = gross_revenue - Total_COGS,
+    
+    # Net Profit
+    net_margin = gross_margin - discount_amount,
+    
+    # Net margin %
+    net_margin_pct = ifelse((gross_revenue - discount_amount) > 0, net_margin / (gross_revenue - discount_amount), 0),
+    
+    # Margin erosion (due to discount)
+    margin_erosion = ifelse(gross_margin > 0, discount_amount / gross_margin, 0),
+    
+    # Discount bucket
+    discount_bucket = cut(discount_rate,
+                          breaks = c(-Inf, 0, 0.05, 0.10, 0.20, 0.30, Inf),
+                          labels = c("No discount","1-5%","5-10%","10-20%","20-30%","30%+"))
+  )
+
+# Outlier handling: TOP 1% -> Isolation
+# Customer level analysis
+customer_summary <- df_3 %>%
+  group_by(customer_id) %>%
+  summarise(
+    Total_Orders = n_distinct(order_id),
+    Total_Spend = sum(gross_revenue - discount_amount, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# 99th percentile
+p99_orders <- quantile(customer_summary$Total_Orders, 0.99, na.rm = TRUE)
+p99_spend  <- quantile(customer_summary$Total_Spend, 0.99, na.rm = TRUE)
+
+# Flag: Whales vs. Normal
+customer_summary <- customer_summary %>%
+  mutate(is_whale = ifelse(Total_Orders > p99_orders | Total_Spend > p99_spend, 1, 0))
+
+# Join into original 
+df_3 <- df_3 %>%
+  left_join(customer_summary %>% select(customer_id, is_whale), by = "customer_id")
+
+# Tách riêng tập Data chuẩn để chạy ML và EDA
+df_3_normal <- df_3 %>% filter(is_whale == 0)
+df_3_whales <- df_3 %>% filter(is_whale == 1)
+
+
+```
+
+# B. EDA
+
+## Q6: Promotion có thực sự hiệu quả?
+
+### I. Descriptive
+
+#### 1. Promo penetration rate
+
+```{r q6a1,echo=FALSE}
+# 1. Promo penetration rate
+df_3 %>%
+  count(has_promo) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = "", y = pct, fill = as.factor(has_promo))) +
+  geom_bar(stat = "identity") +
+  coord_polar("y") +
+  labs(title = "% order with promo") +
+  scale_fill_manual(values = c("#B5D4F4","#EF9F27"))
+```
+
+#### 2. Revenue breakdown: promo vs non-promo
+
+```{r q6a2,echo=FALSE}
+df_3 %>%
+  group_by(has_promo, year) %>%
+  summarise(
+    total_revenue    = sum(gross_revenue),
+    total_discount   = sum(discount_amount),
+    total_net_margin = sum(net_margin),
+    n_orders         = n()
+  ) %>%
+  ggplot(aes(x = year, y = total_revenue, fill = has_promo)) +
+  geom_col(position = "stack") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Revenue: promo vs non-promo by year")
+```
+
+#### 3. Discount rate distribution
+
+```{r q6a3,echo=FALSE}
+df_3 %>% filter(has_promo == "1") %>%
+  ggplot(aes(x = discount_rate)) +
+  geom_histogram(binwidth = 0.01, boundary = 0, fill = "#EF9F27", alpha = 0.8) +
+  geom_vline(xintercept = c(0.05, 0.10, 0.20, 0.30), 
+             linetype = "dashed", color = "red") +
+  scale_x_continuous(labels = percent) +
+  labs(title = "Phân bố discount rate trong các đơn có promo")
+
+# 4. Summary table — Promotion overview
+df_3 %>%
+  group_by(has_promo) %>%
+  summarise(
+    n_orders         = n(),
+    avg_order_value  = mean(gross_revenue),
+    avg_discount     = mean(discount_amount),
+    avg_margin       = mean(net_margin),
+    return_rate      = mean(is_returned == "1", na.rm = TRUE)
+  )
+```
+
+#### 4. Trend & Composition: Tỷ trọng doanh thu Promo vs Non-Promo theo tháng (100% Stacked Area)
+
+```{r q6a4,echo=FALSE}
+df_3 %>%
+  # Làm tròn order_date về ngày đầu tiên của tháng để vẽ Time-series
+  mutate(order_month = floor_date(order_date, "month")) %>%
+  group_by(order_month, has_promo) %>%
+  summarise(
+    total_revenue = sum(gross_revenue, na.rm = TRUE), 
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = order_month, y = total_revenue, fill = has_promo)) +
+  # position = "fill" là keyword bắt buộc để vẽ biểu đồ Tỷ trọng 100%
+  geom_area(position = "fill", alpha = 0.85, color = "white", linewidth = 0.2) + 
+  # Chuyển trục Y về hiển thị phần trăm (0% -> 100%)
+  scale_y_continuous(labels = scales::percent_format()) +
+  # Xử lý màu và nhãn cho đồng bộ với các chart trên
+  scale_fill_manual(
+    values = c("0" = "#B5D4F4", "1" = "#EF9F27"),
+    labels = c("0" = "Không Promo", "1" = "Có Promo")
+  ) +
+  labs(
+    title = "Cấu trúc Doanh thu (Composition): Promo vs Non-Promo theo tháng",
+    subtitle = "Đánh giá mức độ phụ thuộc vào Khuyến mãi qua thời gian",
+    x = "Tháng",
+    y = "Tỷ trọng Doanh thu (%)",
+    fill = "Trạng thái"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### II. Diagnostic
+
+#### 1. A/B Testing
+
+##### Uplift Analysis: T-test cho AOV (gross_revenue): Liệu has_promo có tăng AOV không?
+
+```{r q6b1a,echo=FALSE}
+cat("--- KẾT QUẢ KIỂM ĐỊNH T-TEST CHO AOV ---\n")
+t_test_result <- t.test(gross_revenue ~ has_promo, data = df_3, var.equal = FALSE)
+print(t_test_result)
+```
+
+--\> Takeaway: Giỏ hàng của nhóm dùng Promo không những không to ra, mà còn BÉ HƠN CÓ Ý NGHĨA THỐNG KÊ so với nhóm khách hàng tự nhiên. Điều này chứng minh chiến lược Promo hiện tại đang thất bại kép: Nó không tạo ra Uplift (kích cầu mua thêm), mà chỉ đang thu hút tệp khách hàng 'săn sale' mua lắt nhắt, trong khi công ty vẫn phải gánh toàn bộ chi phí chiết khấu. Khuyến mãi đang hoạt động như một loại 'thuế tự nguyện' mà công ty tự áp lên lợi nhuận của chính mình
+
+Vậy tại sao lại bé hơn? Nghiên cứu sự khác biệt Q - P giữa 2 nhóm No discount - Có discount
+
+```{r q6b1a cont, echo=FALSE}
+library(patchwork) # Để ghép các chart lại với nhau cho đẹp
+
+# --- 1. TEST GIẢ THUYẾT Q (Quantity) & P (Price) ---
+# So sánh xem khách dùng mã thích mua "đồ rẻ" hay mua "ít món"
+p1 <- df_3 %>%
+  group_by(has_promo) %>%
+  summarise(
+    avg_qty = mean(quantity, na.rm = TRUE),
+    avg_price = mean(price, na.rm = TRUE)
+  ) %>%
+  tidyr::pivot_longer(cols = c(avg_qty, avg_price)) %>%
+  ggplot(aes(x = has_promo, y = value, fill = has_promo)) +
+  geom_col() +
+  facet_wrap(~name, scales = "free_y") +
+  scale_fill_manual(values = c("0" = "#B5D4F4", "1" = "#EF9F27")) +
+  labs(title = "Cấu trúc giỏ hàng: Q vs P", x = "Has Promo", y = "Giá trị TB") +
+  theme_minimal()
+
+# --- 2. TEST GIẢ THUYẾT CATEGORY (Ngành hàng) ---
+# Xem ngành hàng nào đang bị "lạm dụng" mã cho đơn nhỏ
+p2 <- df_3 %>%
+  group_by(category, has_promo) %>%
+  summarise(avg_gross_rev = mean(gross_revenue, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = category, y = avg_gross_rev, fill = has_promo)) +
+  geom_col(position = "dodge") +
+  coord_flip() + # Xoay ngang cho dễ đọc tên Category
+  scale_fill_manual(values = c("0" = "#B5D4F4", "1" = "#EF9F27")) +
+  labs(title = "AOV theo Category", x = "", y = "Average Gross Revenue") +
+  theme_minimal()
+
+# --- 3. TEST GIẢ THUYẾT SOURCE (Nguồn đơn) ---
+# Có phải khách từ Paid Search/Social chỉ vào "đớp" mã rồi đi?
+p3 <- df_3 %>%
+  group_by(order_source, has_promo) %>%
+  summarise(avg_gross_rev = mean(gross_revenue, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = order_source, y = avg_gross_rev, fill = has_promo)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("0" = "#B5D4F4", "1" = "#EF9F27")) +
+  labs(title = "AOV theo Order Source", x = "Nguồn đơn", y = "Average Gross Revenue") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Ghép 3 chart lại để nhìn tổng thể
+(p1 / p3) | p2
+```
+
+--\> Takeaway: Sau khi has_promo, chủ yếu là do người dùng chọn đồ có giá gốc rẻ hơn sẵn (?),quantity không đổi mấy. Tuy nhiên AOV rẻ hơn cũng không đáng kể
+
+##### Margin Erosion by Discount Bucket
+
+```{r q6b1b,echo=FALSE}
+df_3 %>%
+  mutate(period = ifelse(order_date <= as.Date("2018-12-31"), 
+                         "Giai đoạn 2012-2018 (Thịnh vượng)", 
+                         "Giai đoạn 2019-Hiện tại (Thử thách)")) %>%
+  group_by(period, discount_bucket) %>%
+  summarise(
+    avg_gross_margin = mean(gross_margin, na.rm = TRUE),
+    avg_net_margin   = mean(net_margin, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_longer(cols = c(avg_gross_margin, avg_net_margin), 
+                      names_to = "margin_type", values_to = "value") %>%
+  ggplot(aes(x = discount_bucket, y = value, fill = margin_type)) +
+  geom_col(position = position_dodge(width = 0.9), alpha = 0.9) +
+  geom_text(
+    aes(label = round(value, 0), 
+        vjust = ifelse(value < 0, 1.5, -0.5)), 
+    position = position_dodge(width = 0.9), 
+    size = 3,
+    fontface = "bold"
+  ) +
+  facet_wrap(~period) + 
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+  scale_fill_manual(
+    values = c("avg_gross_margin" = "#B5D4F4", "avg_net_margin" = "#E24B4A"),
+    labels = c("Lợi nhuận Gộp (Trước giảm giá)", "Lợi nhuận Ròng (Sau giảm giá)")
+  ) +
+  labs(
+    title = "So sánh hiệu quả Khuyến mãi: Thời kỳ Thịnh vượng vs Suy thoái",
+    subtitle = "Khi Revenue giảm, mức độ 'cắt máu' của Promo có trở nên nghiêm trọng hơn?",
+    x = "Mức giảm giá", 
+    y = "Giá trị trung bình/Đơn",
+    fill = "Loại lợi nhuận"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold", size = 12)) 
+```
+
+--\> Takeaway: Discount amount có gây Margin Erosion, tuy nhiên không có sự khác biệt giữa 2 giai đoạn. AOV gốc giai đoạn sau tăng (dù tổng R giảm) -\> Cần investigate quantity
+
+Revenue từng nhóm có bù được cho sụt giảm đó không?
+
+```{r q6b1b cont,echo=FALSE}
+df_3 %>%
+  mutate(period = ifelse(order_date <= as.Date("2018-12-31"), 
+                         "Giai đoạn 2012-2018 (Thịnh vượng)", 
+                         "Giai đoạn 2019-Hiện tại (Thử thách)")) %>%
+  group_by(period, discount_bucket) %>%
+  summarise(
+    total_revenue      = sum(gross_revenue, na.rm = TRUE),
+    total_gross_margin = sum(gross_margin, na.rm = TRUE),
+    total_net_margin   = sum(net_margin, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Chuyển data sang dạng Long để vẽ 3 cột
+  tidyr::pivot_longer(cols = c(total_revenue, total_gross_margin, total_net_margin), 
+                      names_to = "metric_type", values_to = "value") %>%
+  # Sắp xếp thứ tự để cột hiện ra theo logic: Revenue -> Gross Margin -> Net Margin
+  mutate(metric_type = factor(metric_type, levels = c("total_revenue", "total_gross_margin", "total_net_margin"))) %>%
+  
+  ggplot(aes(x = discount_bucket, y = value, fill = metric_type)) +
+  geom_col(position = position_dodge(width = 0.9), alpha = 0.9) +
+  
+  # Chú thích số (đã chia cho 1000 - đơn vị k)
+  geom_text(
+    aes(label = scales::comma(round(value/1000, 0)), 
+        vjust = ifelse(value < 0, 1.5, -0.5)), 
+    position = position_dodge(width = 0.9), 
+    size = 2.5,
+    fontface = "bold"
+  ) +
+  
+  facet_wrap(~period, scales = "free_y") + 
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+  
+  scale_fill_manual(
+    values = c("total_revenue" = "#4A90E2",      
+               "total_gross_margin" = "#2ECC71", 
+               "total_net_margin" = "#E24B4A"),  
+    labels = c("Gross Revenue", "Gross Margin", "Net Margin")
+  ) +
+  
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Chuỗi giá trị: Doanh thu -> Lãi gộp -> Lãi ròng",
+    subtitle = "Đơn vị: Nghìn (k) - So sánh sức tàn phá của chi phí Promo lên biên lợi nhuận sản phẩm",
+    x = "Mức giảm giá", 
+    y = "Tổng giá trị (Sum)",
+    fill = "Chỉ số"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold", size = 11))
+```
+
+--\> Takeaway: Nhóm giảm giá 10-20% đang có has_promo gây xói mòn lợi nhuận cao nhất (vốn đã có Gross Margin % thấp, nay lại thêm hiệu ứng has_promo). Các nhóm còn lại thì has_promo gây ảnh hưởng ít hơn. Tuy nhiên thì thấy bên no discount cũng bù lỗ được? --\> Không nên investigate Margin Erosion nhiều hơn
+
+##### Stacked Promo: Lỗ hổng hệ thống có đang gây thiệt hại không?
+
+```{r q6b1c,include=FALSE}
+cat("\n--- BÁO CÁO THIỆT HẠI TỪ VIỆC CHO GỘP MÃ (STACKABLE) ---\n")
+df_3 %>%
+  filter(has_promo == "1") %>%
+  group_by(is_stacked) %>%
+  summarise(
+    n_orders            = n(),
+    avg_net_margin      = mean(net_margin, na.rm = TRUE),
+    # Tính tỷ lệ % số đơn bị lỗ (Net margin < 0)
+    pct_negative_margin = mean(net_margin < 0, na.rm = TRUE), 
+    total_discount      = sum(discount_amount, na.rm = TRUE)
+  ) %>%
+  mutate(
+    pct_negative_margin = scales::percent(pct_negative_margin, accuracy = 0.1),
+    total_discount      = scales::comma(total_discount)
+  ) %>%
+  print()
+```
+
+--\> Takeaway: Không có insight lắm
+
+##### Return Rate Analysis: Promo làm tăng tỉ lệ hoàn hàng?
+
+```{r q6b1d,ìnclude=FALSE}
+# ====================================================================
+df_3 %>%
+  # 1. Gom nhóm theo tháng và trạng thái Promo
+  mutate(month_year = floor_date(order_date, "month")) %>%
+  group_by(month_year, has_promo) %>%
+  summarise(
+    return_rate = mean(is_returned == "1", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # 2. Vẽ biểu đồ đường để thấy xu hướng
+  ggplot(aes(x = month_year, y = return_rate, color = has_promo)) +
+  geom_line(linewidth = 1, alpha = 0.8) +
+  geom_point(size = 1.5) + # Thêm chấm để dễ nhìn mốc tháng
+  
+  # 3. Kẻ đường ranh giới 2019 (Mốc khủng hoảng)
+  geom_vline(xintercept = as.numeric(as.Date("2019-01-01")), 
+             linetype = "dashed", color = "red", linewidth = 0.8) +
+  annotate("text", x = as.Date("2019-02-01"), y = 0.15, 
+           label = "Giai đoạn suy thoái", color = "red", fontface = "bold", hjust = 0) +
+  
+  # 4. Định dạng biểu đồ
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_color_manual(
+    values = c("0" = "#4A90E2", "1" = "#EF9F27"),
+    labels = c("Không Promo (Organic)", "Có Promo"),
+    name = "Trạng thái đơn"
+  ) +
+  labs(
+    title = "Sự biến động Tỷ lệ Hoàn hàng qua thời gian",
+    subtitle = "So sánh chất lượng đơn hàng giữa nhóm Promo vs Nhóm Tự nhiên",
+    x = "Thời gian (Tháng/Năm)",
+    y = "Tỷ lệ Hoàn hàng (%)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+--\> Takeaway: No insight, bye
+
+#### 2. Causal Impact
+
+Preparation: Xác định 2 thời điểm Intervention (bắt đầu giảm giá nhiều + bắt đầu cắt giảm giảm giá) --\> Line chart xem biến động của Độ sâu chiết khấu (Average Discount Rate) --\> Đối chiếu Total_Discount với Total_Revenue
+
+```{r q6b2 prep, echo = FALSE}
+df_3 %>%
+  filter(has_promo == "1") %>%
+  mutate(month_year = floor_date(order_date, "month")) %>%
+  group_by(month_year) %>%
+  summarise(
+    avg_discount_rate = mean(discount_rate, na.rm = TRUE), 
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = month_year, y = avg_discount_rate)) +
+  geom_line(color = "#EF9F27", linewidth = 1) +
+  # Thêm đường xu hướng (trend line) màu đỏ để dễ nhìn thấy "điểm gãy"
+  geom_smooth(method = "loess", color = "red", linetype = "dashed", se = FALSE, linewidth = 0.8) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Độ sâu chiết khấu: Trung bình Discount Rate theo tháng",
+    subtitle = "Tìm điểm gãy (Structural Break) để xác định mốc Intervention",
+    x = "Thời gian",
+    y = "Average Discount Rate (%)"
+  ) +
+  theme_minimal()
+
+df_3 %>%
+  mutate(month_year = floor_date(order_date, "month")) %>%
+  group_by(month_year) %>%
+  summarise(
+    total_revenue  = sum(gross_revenue, na.rm = TRUE),
+    total_discount = sum(discount_amount, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Chuyển data về dạng long để vẽ 2 đường cùng lúc dễ dàng
+  tidyr::pivot_longer(cols = c(total_revenue, total_discount), 
+                      names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = month_year, y = value, color = metric)) +
+  geom_line(linewidth = 1) +
+  # Dùng facet_wrap để tách 2 trục Y (vì Revenue to hơn Discount rất nhiều)
+  facet_wrap(~metric, scales = "free_y", ncol = 1) +
+  scale_color_manual(values = c("total_discount" = "#EF9F27", "total_revenue" = "#4A90E2")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Sự đồng pha tuyệt đối giữa Doanh Thu và Chi phí Khuyến mãi",
+    subtitle = "Chi phí tăng đơn thuần do quy mô (Volume) tăng, không phải do thay đổi chính sách (Policy)",
+    x = "Năm",
+    y = "Total Value"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none") 
+```
+
+Đối chiếu Total_Discount với % Discount
+
+```{r q6b1,echo=FALSE}
+# 1. TẠO BẢNG TỔNG HỢP THEO THÁNG (10 NĂM)
+timeline_data <- df_3 %>%
+  # Gom nhóm dữ liệu về ngày mùng 1 của từng tháng
+  mutate(month_year = floor_date(order_date, "month")) %>%
+  group_by(month_year) %>%
+  summarise(
+    total_discount = sum(discount_amount, na.rm = TRUE),
+    total_revenue  = sum(gross_revenue, na.rm = TRUE),
+    # Tính tỷ lệ % số đơn có dùng mã trong tháng đó
+    promo_penetration = mean(has_promo == "1", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 2. VẼ CHART 1: DÒNG TIỀN "ĐỐT" VÀO KHUYẾN MÃI (TÌM CÚ NỔ)
+p1 <- ggplot(timeline_data, aes(x = month_year, y = total_discount)) +
+  geom_line(color = "#EF9F27", linewidth = 1) +
+  geom_smooth(method = "loess", color = "red", linetype = "dashed", se = FALSE, linewidth = 0.5) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Radar 1: Tổng tiền chi cho Khuyến mãi (Discount Spend) theo tháng",
+    subtitle = "Tìm những tháng có cột mốc vọt lên đột biến để đo Causal Impact",
+    x = "", y = "Total Discount"
+  ) +
+  theme_minimal()
+
+# 3. VẼ CHART 2: TỶ LỆ BAO PHỦ KHUYẾN MÃI (TÌM ĐIỂM XOAY TRỤC)
+p2 <- ggplot(timeline_data, aes(x = month_year, y = promo_penetration)) +
+  geom_area(fill = "#B5D4F4", alpha = 0.5) +
+  geom_line(color = "#4A90E2", linewidth = 1) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Radar 2: Tỷ lệ đơn hàng có áp mã (Promo Penetration)",
+    subtitle = "Tìm thời điểm công ty thay đổi chiến lược lạm dụng khuyến mãi",
+    x = "Năm", y = "% Đơn có Promo"
+  ) +
+  theme_minimal()
+
+# 4. GHÉP 2 CHART BẰNG PATCHWORK
+p1 / p2
+```
+
+--\> Takeaway: Không làm Causal Impact ở đây vì discount amount đồng pha với revenue, không phải do policy chiết khấu
+
+### III. Predictive
+
+#### 1. Uplift Model
+
+```{r q6b3a,echo=FALSE}
+# Phân biệt promo effect vs selection bias (good products always sell)
+
+# Simple approach: Propensity Score Matching
+library(MatchIt)
+df_3_model <- df_3 %>%
+  filter(!is.na(discount_rate)) %>%
+  mutate(
+    has_promo_num = as.numeric(as.character(has_promo)),
+    category_num  = as.integer(as.factor(category)),
+    month_num     = month
+  ) %>%
+  filter(!is.na(has_promo_num), 
+         !is.na(category_num), 
+         !is.na(month_num), 
+         !is.na(price))
+
+# --- BƯỚC CHẠY MÔ HÌNH: PSM match promo vs non-promo ---
+match_out <- matchit(
+  has_promo_num ~ category_num + month_num + price,
+  data = df_3_model, 
+  method = "nearest", 
+  distance = "glm", # Chỉ định dùng logistic regression để tính propensity score
+  ratio = 1
+)
+
+# Kiểm tra xem đã match thành công chưa
+summary(match_out)
+
+# So sánh revenue trên matched sample → true uplift
+# 1. Trích xuất dữ liệu đã được matching (Mẫu so sánh công bằng)
+df_matched <- match.data(match_out)
+
+# 2. KIỂM ĐỊNH THỐNG KÊ (Claude's logic)
+# Trả lời câu hỏi: Sự khác biệt này là thật hay do ngẫu nhiên?
+t_test_rev <- t.test(gross_revenue ~ has_promo_num, data = df_matched)
+t_test_qty <- t.test(quantity ~ has_promo_num, data = df_matched)
+
+# 3. TÍNH TOÁN BUSINESS METRICS (My logic)
+# Trả lời câu hỏi: Cụ thể là mất bao nhiêu tiền, hụt bao nhiêu doanh thu?
+summary_matched <- df_matched %>%
+  group_by(has_promo_num) %>%
+  summarise(
+    n_orders = n(),
+    avg_gross_revenue = mean(gross_revenue),
+    avg_net_margin    = mean(net_margin),
+    avg_quantity      = mean(quantity),
+    .groups = "drop"
+  )
+
+# 4. TÍNH % UPLIFT THỰC TẾ
+# So sánh nhóm 1 (Has Promo) so với nhóm 0 (No Promo - Baseline)
+uplift_results <- summary_matched %>%
+  summarise(
+    revenue_uplift_pct  = percent((avg_gross_revenue[has_promo_num==1] - avg_gross_revenue[has_promo_num==0]) / avg_gross_revenue[has_promo_num==0]),
+    margin_drain_pct    = percent((avg_net_margin[has_promo_num==1] - avg_net_margin[has_promo_num==0]) / abs(avg_net_margin[has_promo_num==0])),
+    quantity_uplift_pct = percent((avg_quantity[has_promo_num==1] - avg_quantity[has_promo_num==0]) / avg_quantity[has_promo_num==0])
+  )
+
+# --- IN KẾT QUẢ ---
+print("--- KẾT QUẢ KIỂM ĐỊNH T-TEST (P-VALUE) ---")
+print(paste("P-value Revenue:", t_test_rev$p.value))
+print("--- BẢNG SO SÁNH METRIC SAU KHI MATCHING ---")
+print(summary_matched)
+print("--- TỶ LỆ UPLIFT/DRAIN THỰC TẾ ---")
+print(uplift_results)
+```
+
+--\> Takeaway: Với các đơn có promo, Revenue tăng có tí, nhưng Margin bị sụt giảm nghiêm trọn (maybe cần phân tích thêm theo time series)
+
+#### 2. Random Forest — predict net_margin \< 0 =====
+
+```{r q6b3b,echo=FALSE}
+library(randomForest)
+library(caret)
+library(ranger)
+df_ml <- df_3 %>%
+  filter(has_promo==1) %>%
+  mutate(
+    margin_negative = as.factor(net_margin < 0),
+    promo_type_f    = as.factor(promo_type),
+    category_f      = as.factor(category),
+    stackable_f     = as.factor(is_stacked)
+  ) %>%
+  select(margin_negative, discount_rate, promo_type_f,
+         category_f, stackable_f, quantity, price, season) %>%
+  drop_na()
+
+set.seed(42)
+train_idx <- createDataPartition(df_ml$margin_negative, p = 0.8, list = FALSE)
+train_df  <- df_ml[train_idx, ]
+test_df   <- df_ml[-train_idx, ]
+
+rf_model <- ranger(
+  margin_negative ~ .,
+  data         = train_df,
+  num.trees    = 500,
+  importance   = "permutation",
+  probability  = TRUE
+)
+
+# Variable importance
+vip_df <- data.frame(
+  variable   = names(rf_model$variable.importance),
+  importance = rf_model$variable.importance
+) %>% arrange(desc(importance))
+
+ggplot(vip_df, aes(x = reorder(variable, importance), y = importance)) +
+  geom_col(fill = "#378ADD") +
+  coord_flip() +
+  labs(title = "Yếu tố nào dự báo margin âm?")
+```
+
+#### 3. XGBoost - Predict revenue uplift
+
+```{r q6b3c,echo=FALSE}
+# Dùng discount_rate làm treatment variable, predict gross_revenue
+# Bước 1: Chuẩn bị data (XGBoost chỉ nhận Numeric Matrix)
+library(xgboost)
+df_xgb_prep <- df_3 %>%
+  # Chuyển các cột Category, Promo_type thành số để model hiểu
+  mutate(
+    category_num   = as.numeric(as.factor(category)),
+    promo_type_num = as.numeric(as.factor(promo_type)),
+    price_val      = price 
+  ) %>%
+  select(gross_revenue, discount_rate, price_val, quantity, 
+         category_num, promo_type_num) %>%
+  drop_na()
+
+# Bước 2: Chia Train/Test riêng cho bảng này để tránh lệch Index
+set.seed(123)
+xgb_idx   <- createDataPartition(df_xgb_prep$gross_revenue, p = 0.8, list = FALSE)
+xgb_train <- df_xgb_prep[xgb_idx, ]
+xgb_test  <- df_xgb_prep[-xgb_idx, ]
+
+# Bước 3: Tạo DMatrix (Định dạng "ruột" của XGBoost)
+features <- c("discount_rate", "price_val", "quantity", "category_num", "promo_type_num")
+
+dtrain <- xgb.DMatrix(data = as.matrix(xgb_train[, features]), 
+                      label = xgb_train$gross_revenue)
+dtest  <- xgb.DMatrix(data = as.matrix(xgb_test[, features]), 
+                      label = xgb_test$gross_revenue)
+
+# Bước 4: Train Model
+xgb_model <- xgb.train(
+  params = list(objective = "reg:squarederror", eta = 0.1, max_depth = 6),
+  data = dtrain,
+  nrounds = 200,
+  watchlist = list(val = dtest),
+  print_every_n = 50,
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+
+# Bước 5: Trực quan hóa "Động cơ" thúc đẩy Doanh thu
+importance_matrix <- xgb.importance(feature_names = features, model = xgb_model)
+
+xgb.plot.importance(importance_matrix, rel_to_first = TRUE, 
+                   main = "Yếu tố nào thực sự tác động đến Doanh thu?",
+                   col = "#EF9F27")
+
+# SHAP Value
+library(SHAPforxgboost)
+
+# 1. Đảm bảo lấy đúng Matrix và CÓ TÊN CỘT
+X_train_matrix <- as.matrix(xgb_train[, features])
+
+# 2. BƯỚC QUAN TRỌNG: Dùng shap.prep để chuẩn hóa định dạng (Fix lỗi 'variable not found')
+shap_long <- shap.prep(
+  xgb_model = xgb_model, 
+  X_train = X_train_matrix
+)
+
+# 3. Vẽ biểu đồ từ dữ liệu đã chuẩn hóa
+shap.plot.summary(shap_long) +
+  labs(
+    title = "SHAP Analysis: Yếu tố nào thực sự tác động đến Doanh thu?",
+    subtitle = "Màu đỏ: Giá trị biến cao | Màu xanh: Giá trị biến thấp",
+    x = "Tác động đến Doanh thu (SHAP Value)",
+    y = "Biến số"
+  ) +
+  theme_minimal()
+```
+
+### IV. Prescriptive
+
+#### 1. Optimal discount threshold — dùng marginal effects
+
+```{r q6b4a,echo=FALSE}
+# Fit GLM: revenue ~ discount_rate + discount_rate^2 + controls
+glm_model <- lm(
+  gross_revenue ~ poly(discount_rate, 2) + category + season + log(unit_price),
+  data = df_3 %>% filter(has_promo==1)
+)
+
+# Marginal effect at each discount level
+library(marginaleffects)
+plot_predictions(glm_model, condition = "discount_rate") +
+  labs(title = "Predicted revenue vs discount rate",
+       subtitle = "Tìm điểm tối ưu (peak revenue)")
+```
+
+#### 2. Break-even discount rate per category
+
+```{r q6b4b,include=FALSE}
+df_3 %>%
+  filter(has_promo==1) %>%
+  group_by(category, discount_bucket) %>%
+  summarise(
+    avg_net_margin = mean(net_margin),
+    n = n()
+  ) %>%
+  ggplot(aes(x = discount_bucket, y = avg_net_margin, color = category, group = category)) +
+  geom_line(linewidth = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Break-even discount per category",
+       subtitle = "Đường đỏ = margin = 0")
+```
+
+--\> Takeaway: Không insight lắm
+
+#### 3. Decision rule: promo có nên chạy không?
+
+```{r q6b4c,echo=FALSE}
+# ROI của promo = incremental revenue / discount_amount
+promo_decision <- df_3 %>%
+  filter(has_promo==1) %>%
+  group_by(promo_name, promo_type) %>%
+  summarise(
+    total_discount    = sum(discount_amount),
+    total_gross_rev   = sum(gross_revenue),
+    total_net_margin  = sum(net_margin),
+    promo_roi         = (sum(net_margin)) / sum(discount_amount),
+    n_orders          = n()
+  ) %>%
+  filter(n_orders >= 20) %>%  # đủ sample
+  arrange(desc(promo_roi)) %>%
+  mutate(
+    recommendation = case_when(
+      promo_roi > 1   ~ "KEEP — positive ROI",
+      promo_roi > 0   ~ "OPTIMIZE — thin margin",
+      TRUE            ~ "KILL — destroys margin"
+    )
+  )
+install.packages("rlang")
+```
+
+--\> Takeaway: Chủ yếu là KEEP & OPTIMIZE?
+
+# Q7: Promo nào tốt nhất? theo: promo_type/ discount_value/ category
+
+## I. Descriptive Analytics - So sánh Promo theo dimension - Performance Matrix
+
+### 1a. Bảng xếp hạng tổng thể: promo_type × KPIs
+
+```{r q7_desc_1, echo=FALSE}
+library(gt)
+
+q7_promo_type_summary <- df_3 %>%
+  filter(has_promo == "1") %>%
+  group_by(promo_type) %>%
+  summarise(
+    n_orders          = n(),
+    total_revenue     = sum(gross_revenue, na.rm = TRUE),
+    total_discount    = sum(discount_amount, na.rm = TRUE),
+    total_net_margin  = sum(net_margin, na.rm = TRUE),
+    avg_aov           = mean(gross_revenue, na.rm = TRUE),
+    avg_discount_rate = mean(discount_rate, na.rm = TRUE),
+    avg_net_margin    = mean(net_margin, na.rm = TRUE),
+    pct_negative_margin = mean(net_margin < 0, na.rm = TRUE),
+    return_rate       = mean(is_returned == "1", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    roi = total_net_margin / total_discount,
+    discount_pct_of_rev = total_discount / total_revenue
+  ) %>%
+  arrange(desc(roi))
+
+q7_promo_type_summary %>%
+  gt() %>%
+  tab_header(
+    title    = md("**Performance Matrix: Promo Type**"),
+    subtitle = "Xếp hạng theo ROI (Net Margin / Discount Spent)"
+  ) %>%
+  fmt_number(columns = c(total_revenue, total_discount, total_net_margin,
+                          avg_aov, avg_net_margin), decimals = 0, use_seps = TRUE) %>%
+  fmt_percent(columns = c(avg_discount_rate, pct_negative_margin,
+                           return_rate, discount_pct_of_rev), decimals = 1) %>%
+  fmt_number(columns = roi, decimals = 2) %>%
+  data_color(
+    columns = roi,
+    palette = c("#E24B4A", "white", "#1D9E75")
+  ) %>%
+  data_color(
+    columns = pct_negative_margin,
+    palette = c("#1D9E75", "white", "#E24B4A")
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = roi == max(roi))
+  )
+```
+
+### 1b. Heatmap: category × discount_bucket → avg net margin
+
+```{r q7_desc_2,echo=FALSE}
+# 1. promo_type comparison
+df_3 %>%
+  filter(has_promo==1) %>%
+  group_by(promo_type) %>%
+  summarise(
+    n_orders          = n(),
+    avg_aov           = mean(gross_revenue),
+    avg_discount_rate = mean(discount_rate),
+    avg_net_margin    = mean(net_margin),
+    return_rate       = mean(is_returned==1)
+  ) %>%
+  pivot_longer(-promo_type) %>%
+  ggplot(aes(x = promo_type, y = value, fill = promo_type)) +
+  geom_col() +
+  facet_wrap(~name, scales = "free_y") +
+  labs(title = "Percentage vs Fixed: so sánh KPIs")
+
+# 2. Heatmap: category × discount_bucket → avg net margin
+df_3 %>%
+  filter(has_promo == 1) %>%
+  group_by(category, discount_bucket) %>%
+  summarise(
+    avg_net_margin = mean(net_margin),
+    n_orders       = n(),
+    .groups        = "drop"
+  ) %>%
+  mutate(pct_orders = n_orders / sum(n_orders)) %>%   # <-- thêm dòng này
+  ggplot(aes(x = discount_bucket, y = category, fill = avg_net_margin)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(
+    aes(label = paste0(
+      scales::comma(round(avg_net_margin, 0)), "\n",
+      "(n=", scales::comma(n_orders), ")", "\n",
+      scales::percent(pct_orders, accuracy = 0.1)        # <-- thêm dòng này
+    )),
+    size     = 3,
+    fontface = "bold",
+    color    = "black"
+  ) +
+  scale_fill_gradient2(
+    low      = "#E24B4A",
+    mid      = "white",
+    high     = "#1D9E75",
+    midpoint = 0,
+    labels   = scales::comma
+  ) +
+  labs(
+    title    = "Net margin heatmap: category × discount level",
+    subtitle = "Đỏ = margin âm, Xanh = margin dương\nLabel: avg net margin / (số đơn) / % trên tổng",
+    x        = "Discount Bucket",
+    y        = "Category",
+    fill     = "Avg Net Margin"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+# 3. Seasonal promo performance
+df_3 %>%
+  filter(has_promo==1) %>%
+  mutate(promo_season = str_extract(promo_name, "Spring|Mid-Year|Year-End|Fall|Urban|Rural")) %>%
+  group_by(promo_season, year) %>%
+  summarise(
+    total_revenue  = sum(gross_revenue),
+    total_discount = sum(discount_amount),
+    n_orders       = n()
+  ) %>%
+  ggplot(aes(x = year, y = total_revenue, color = promo_season, group = promo_season)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(title = "Revenue trend by promo season (2013–2022)")
+
+```
+
+### 1c. Multi-KPI radar: promo_name top 20 theo ROI
+
+```{r q7_desc_3, echo=FALSE}
+top20_promos <- promo_decision %>%
+  slice_head(n = 50) %>%
+  pull(promo_name)
+
+q7_radar_raw <- df_3 %>%
+  filter(has_promo == "1", promo_name %in% top20_promos) %>%
+  group_by(promo_name) %>%
+  summarise(
+    volume_score  = n(),
+    revenue_score = sum(gross_revenue, na.rm = TRUE),
+    margin_score  = mean(net_margin, na.rm = TRUE),
+    roi_score     = sum(net_margin, na.rm = TRUE) / sum(discount_amount, na.rm = TRUE),
+    low_return    = 1 - mean(is_returned == "1", na.rm = TRUE),
+    .groups       = "drop"
+  ) %>%
+  mutate(
+    promo_group = case_when(
+      str_detect(promo_name, regex("Spring",   ignore_case = TRUE)) ~ "Spring",
+      str_detect(promo_name, regex("Mid-Year", ignore_case = TRUE)) ~ "Mid-Year",
+      str_detect(promo_name, regex("Year-End", ignore_case = TRUE)) ~ "Year-End",
+      str_detect(promo_name, regex("Fall",     ignore_case = TRUE)) ~ "Fall",
+      str_detect(promo_name, regex("Urban",    ignore_case = TRUE)) ~ "Urban",
+      str_detect(promo_name, regex("Rural",    ignore_case = TRUE)) ~ "Rural",
+      TRUE ~ "Other"
+    ),
+    promo_year = as.integer(str_extract(promo_name, "\\d{4}")),
+    across(c(volume_score, revenue_score, margin_score, roi_score, low_return),
+           ~ scales::rescale(.x, to = c(0, 1))),  # <-- explicit columns, không đụng promo_year
+    promo_name = fct_reorder(promo_name, promo_year)  # <-- sort SAU rescale, promo_year còn nguyên
+  )
+
+q7_radar_raw %>%
+  pivot_longer(-c(promo_name, promo_group, promo_year),
+               names_to = "kpi", values_to = "score") %>%
+  ggplot(aes(x = promo_name, y = score, fill = kpi)) +  # <-- 1. bỏ coord_flip: x = promo_name
+  geom_col(position = "dodge", alpha = 0.85) +
+  # KHÔNG có coord_flip()                                # <-- 1. xóa coord_flip
+  facet_grid(kpi ~ promo_group, scales = "free", space = "free_x") +  # <-- 1. đổi grid: rows=kpi, cols=group
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title    = "Top 50 Promo — Multi-KPI Performance (Normalized 0→1)",
+    subtitle = "Facet ngang: nhóm promo | Facet dọc: KPI | Sắp xếp theo năm xa → gần",
+    x        = "Promo Name",
+    y        = "Normalized Score"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    legend.position  = "none",
+    strip.text.y     = element_text(angle = 0, face = "bold"),
+    strip.text.x     = element_text(face = "bold"),
+    strip.background = element_rect(fill = "grey92", color = NA),
+    axis.text.x      = element_text(angle = 45, hjust = 1)  # <-- xoay label năm cho dễ đọc
+  )
+```
+
+### 1d. Bubble chart: promo_name tổng thể — Volume vs Margin vs ROI
+
+```{r q7_desc_4, echo=FALSE}
+promo_bubble <- df_3 %>%
+  filter(has_promo == "1") %>%
+  group_by(promo_name, promo_type) %>%
+  summarise(
+    n_orders       = n(),
+    avg_net_margin = mean(net_margin, na.rm = TRUE),
+    roi            = sum(net_margin, na.rm = TRUE) / sum(discount_amount, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_orders >= 30)
+
+ggplot(promo_bubble, aes(x = roi, y = avg_net_margin,
+                          size = n_orders, color = promo_type, label = promo_name)) +
+  geom_point(alpha = 0.6) +
+  ggrepel::geom_text_repel(size = 2.5, max.overlaps = 15) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  scale_size_continuous(range = c(2, 15), labels = scales::comma) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title    = "Promo Portfolio Map: ROI vs Margin vs Volume",
+    subtitle = "Góc trên-phải = Ngôi sao | Góc dưới-trái = Zombie cần khai tử",
+    x        = "ROI (Net Margin / Discount Spent)",
+    y        = "Average Net Margin / đơn",
+    size     = "N Orders",
+    color    = "Promo Type"
+  ) +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+## II. Diagnostic — Price Elasticity & Market Basket
+
+### 2a. Price Elasticity of Demand (Log-Log Regression)
+
+```{r q7_diag_1, echo=FALSE}
+# Chuẩn bị: chỉ dùng đơn có promo, price > discount (tránh log(0))
+q7_elas_df <- df_3 %>%
+  filter(has_promo == "1",
+         price > 0,
+         (price - discount_amount / quantity) > 0,
+         quantity > 0) %>%
+  mutate(
+    effective_price = price - (discount_amount / quantity),  # Giá thực tế sau chiết khấu
+    log_qty   = log(quantity),
+    log_price = log(effective_price)
+  )
+
+# Log-log OLS: ε = hệ số β của log(price)
+elas_model <- lm(log_qty ~ log_price + as.factor(category) + as.factor(season), 
+                 data = q7_elas_df)
+
+elas_summary <- broom::tidy(elas_model) %>%
+  filter(term == "log_price") %>%
+  mutate(
+    elasticity = estimate,
+    interpretation = case_when(
+      estimate < -1 ~ "Elastic (Giảm giá làm tăng volume mạnh)",
+      estimate > -1 & estimate < 0 ~ "Inelastic (Giảm giá ít tác dụng)",
+      TRUE ~ "Positive (Giffen / data anomaly)"
+    )
+  )
+
+cat("=== HỆ SỐ CO GIÃN CẦU (Price Elasticity of Demand) ===\n")
+cat("Elasticity (ε) =", round(elas_summary$elasticity, 3), "\n")
+cat("Diễn giải:", elas_summary$interpretation, "\n")
+cat("P-value:", round(elas_summary$p.value, 5), "\n")
+cat("\nÝ nghĩa: Tăng 1% effective price → quantity thay đổi", 
+    round(elas_summary$elasticity, 2), "%\n")
+
+# Elasticity by category
+elas_by_cat <- df_3 %>%
+  filter(has_promo == "1",
+         price > 0,
+         (price - discount_amount / quantity) > 0,
+         quantity > 0) %>%
+  mutate(
+    effective_price = price - (discount_amount / quantity),
+    log_qty         = log(quantity),
+    log_price       = log(effective_price)
+  ) %>%
+  group_by(category) %>%
+  group_modify(~ {
+    m <- lm(log_qty ~ log_price, data = .x)
+    broom::tidy(m) %>% filter(term == "log_price")
+  }) %>%
+  ungroup() %>%
+  select(category, elasticity = estimate, p.value) %>%
+  mutate(significant = p.value < 0.05)
+
+elas_by_cat %>%
+  ggplot(aes(x = reorder(category, elasticity), y = elasticity, 
+             fill = elasticity, alpha = significant)) +
+  geom_col() +
+  geom_hline(yintercept = -1, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0,  linetype = "solid",  color = "black", linewidth = 0.3) +
+  geom_text(aes(label = round(elasticity, 2)), hjust = -0.2, size = 3.5) +
+  coord_flip() +
+  scale_fill_gradient2(low = "#1D9E75", mid = "white", high = "#E24B4A", midpoint = -1) +
+  scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4)) +
+  labs(
+    title    = "Price Elasticity by Category",
+    subtitle = "Đường đỏ: ε = -1 (ngưỡng elastic/inelastic)\nCột mờ = không có ý nghĩa thống kê",
+    x = "Category", y = "Elasticity (ε)",
+    fill = "ε", alpha = "Significant"
+  ) +
+  theme_minimal()
+```
+
+### 2b. Market Basket Analysis — Promo có kéo Cross-sell không?
+
+```{r q7_diag_2, echo=FALSE}
+library(arules)
+library(arulesViz)
+
+# Chuẩn bị transaction: mỗi order_id = 1 giỏ hàng, item = category
+q7_basket_df <- df_3 %>%
+  filter(has_promo == "1") %>%
+  group_by(order_id) %>%
+  summarise(items = list(unique(category)), .groups = "drop") %>%
+  filter(lengths(items) >= 2)  # Chỉ lấy đơn có >= 2 category (cross-sell mới xảy ra)
+
+# Chuyển về transactions object
+trans_list <- as(q7_basket_df$items, "transactions")
+
+# Chạy Apriori
+rules <- apriori(
+  trans_list,
+  parameter = list(supp = 0.01, conf = 0.3, minlen = 2, maxlen = 3)
+)
+
+cat("Số lượng association rules tìm được:", length(rules), "\n")
+
+if (length(rules) > 0) {
+  top_rules <- sort(rules, by = "lift")[1:min(15, length(rules))]
+  
+  top_rules_df <- as(top_rules, "data.frame") %>%
+    arrange(desc(lift))
+  
+  top_rules_df %>%
+    gt() %>%
+    tab_header(
+      title    = md("**Top Association Rules (Cross-sell Patterns)**"),
+      subtitle = "Lift > 1 → Hai category thường xuất hiện cùng nhau khi có promo"
+    ) %>%
+    fmt_number(columns = c(support, confidence, lift), decimals = 3) %>%
+    data_color(columns = lift, palette = c("white", "#1D9E75"))
+  
+  # Graph visualization (chỉ lấy top 20 rules)
+  plot(head(sort(rules, by = "lift"), 20),
+       method = "graph",
+       engine = "htmlwidget")
+} else {
+  cat("Không tìm được rules ở ngưỡng này — thử giảm support/confidence.\n")
+}
+```
+
+### 2c. Discount Depth vs Volume: Có thực sự kích cầu?
+
+```{r q7_diag_3, echo=FALSE}
+# Segmented analysis: Discount bucket → avg quantity & avg margin
+q7_depth_volume <- df_3 %>%
+  filter(has_promo == "1") %>%
+  group_by(discount_bucket, category) %>%
+  summarise(
+    avg_qty        = mean(quantity, na.rm = TRUE),
+    avg_net_margin = mean(net_margin, na.rm = TRUE),
+    n              = n(),
+    .groups = "drop"
+  )
+
+p_vol <- q7_depth_volume %>%
+  ggplot(aes(x = discount_bucket, y = avg_qty, color = category, group = category)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  labs(title = "Volume (Qty) theo Discount Bucket & Category",
+       x = "Discount Level", y = "Avg Quantity") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+p_mar <- q7_depth_volume %>%
+  ggplot(aes(x = discount_bucket, y = avg_net_margin, color = category, group = category)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Net Margin theo Discount Bucket & Category",
+       subtitle = "Đường đỏ: break-even",
+       x = "Discount Level", y = "Avg Net Margin") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+p_vol / p_mar
+```
+
+### 2d. Stackable Promo Deep-dive: Đang lỗ hay lời?
+
+```{r q7_diag_4, echo=FALSE}
+# Phân tích chi tiết stack: promo_type + stack vs non-stack
+q7_stack_analysis <- df_3 %>%
+  filter(has_promo == "1") %>%
+  group_by(promo_type, is_stacked) %>%
+  summarise(
+    n_orders            = n(),
+    avg_discount_rate   = mean(discount_rate, na.rm = TRUE),
+    avg_net_margin      = mean(net_margin, na.rm = TRUE),
+    pct_negative_margin = mean(net_margin < 0, na.rm = TRUE),
+    total_discount_cost = sum(discount_amount, na.rm = TRUE),
+    roi                 = sum(net_margin, na.rm = TRUE) / sum(discount_amount, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+q7_stack_analysis %>%
+  gt() %>%
+  tab_header(
+    title    = md("**Stackable vs Non-Stackable Promo: So sánh hiệu quả**"),
+    subtitle = "is_stacked = 1 → Đơn dùng đồng thời 2 mã khuyến mãi"
+  ) %>%
+  fmt_percent(columns = c(avg_discount_rate, pct_negative_margin), decimals = 1) %>%
+  fmt_number(columns = c(avg_net_margin, roi, total_discount_cost), decimals = 2) %>%
+  data_color(
+    columns = roi,
+    palette = c("#E24B4A", "white", "#1D9E75")
+  ) %>%
+  data_color(
+    columns = pct_negative_margin,
+    palette = c("#1D9E75", "white", "#E24B4A")
+  )
+```
+
+------------------------------------------------------------------------
+
+## III. Predictive — XGBoost Profit Curve + Optimal Discount
+
+### 3a. Train XGBoost: Predict net_margin từ discount_rate
+
+```{r q7_pred_1, echo=FALSE}
+# Dùng df_3_normal (đã loại whale ở phần A) để tránh skew
+q7_xgb_df <- df_3_normal %>%
+  filter(has_promo == "1") %>%
+  mutate(
+    category_num   = as.numeric(as.factor(category)),
+    promo_type_num = as.numeric(as.factor(promo_type)),
+    season_num     = as.numeric(as.factor(season))
+  ) %>%
+  select(net_margin, discount_rate, price, quantity,
+         category_num, promo_type_num, season_num) %>%
+  drop_na()
+
+set.seed(2024)
+xgb_q7_idx   <- createDataPartition(q7_xgb_df$net_margin, p = 0.8, list = FALSE)
+xgb_q7_train <- q7_xgb_df[xgb_q7_idx, ]
+xgb_q7_test  <- q7_xgb_df[-xgb_q7_idx, ]
+
+q7_features <- c("discount_rate", "price", "quantity", "category_num", 
+                  "promo_type_num", "season_num")
+
+dtrain_q7 <- xgb.DMatrix(
+  data  = as.matrix(xgb_q7_train[, q7_features]),
+  label = xgb_q7_train$net_margin
+)
+dtest_q7 <- xgb.DMatrix(
+  data  = as.matrix(xgb_q7_test[, q7_features]),
+  label = xgb_q7_test$net_margin
+)
+
+xgb_q7_model <- xgb.train(
+  params = list(
+    objective        = "reg:squarederror",
+    eta              = 0.05,
+    max_depth        = 6,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data                  = dtrain_q7,
+  nrounds               = 500,
+  watchlist             = list(val = dtest_q7),
+  early_stopping_rounds = 20,
+  print_every_n         = 100,
+  verbose               = 1,
+  eval_metric           = "rmse"   # <-- thêm dòng này cho chắc
+)
+
+cat("\n=== MODEL PERFORMANCE ===\n")
+cat("Best iteration:", xgb_q7_model$best_iteration, "\n")
+
+# Predict thẳng trên test set rồi tính RMSE tay
+best_rmse <- sqrt(mean((predict(xgb_q7_model, dtest_q7) - xgb_q7_test$net_margin)^2))
+cat("Best val RMSE:", round(best_rmse, 2), "\n")
+```
+
+### 3b. Profit Curve Simulation — Tìm Optimal Discount Rate
+
+```{r q7_pred_2, echo=FALSE}
+# Simulate dải discount từ 0% đến 60% cho từng category
+simulate_profit_by_category <- function(cat_name, xgb_model, ref_data, features) {
+  
+  # Lấy đặc trưng trung bình của category đó làm baseline
+  baseline <- ref_data %>%
+    filter(category_num == as.numeric(as.factor(df_3_normal$category))[
+      match(cat_name, levels(as.factor(df_3_normal$category)))]) %>%
+    summarise(
+      avg_price       = mean(price, na.rm = TRUE),
+      avg_qty         = mean(quantity, na.rm = TRUE),
+      avg_promo_type  = round(mean(promo_type_num, na.rm = TRUE)),
+      cat_num         = mean(category_num, na.rm = TRUE),
+      avg_season_num  = round(mean(season_num, na.rm = TRUE))
+    )
+  
+  discount_seq <- seq(0, 0.60, by = 0.01)
+  
+  sim_matrix <- data.frame(
+    discount_rate  = discount_seq,
+    price          = baseline$avg_price,
+    quantity       = baseline$avg_qty,
+    category_num   = baseline$cat_num,
+    promo_type_num = baseline$avg_promo_type,
+    season_num     = baseline$avg_season_num
+  )
+  
+  sim_pred <- predict(xgb_model,
+                      xgb.DMatrix(data = as.matrix(sim_matrix[, features])))
+  
+  data.frame(
+    category      = cat_name,
+    discount_rate = discount_seq,
+    predicted_net_margin = sim_pred
+  )
+}
+
+# Lấy danh sách categories
+cat_levels  <- levels(as.factor(df_3_normal$category))
+cat_num_map <- setNames(seq_along(cat_levels), cat_levels)
+
+# Rebuild ref_data với đúng category_num encoding
+q7_sim_ref <- df_3_normal %>%
+  filter(has_promo == "1") %>%
+  mutate(
+    category_num   = as.numeric(as.factor(category)),
+    promo_type_num = as.numeric(as.factor(promo_type)),
+    season_num     = as.numeric(as.factor(season))
+  ) %>%
+  drop_na(net_margin, discount_rate, price, quantity,
+          category_num, promo_type_num, season_num)
+
+# Simulation: discount rate dải 0–60% theo từng category (dùng toàn data)
+discount_sim_grid <- expand.grid(
+  discount_rate  = seq(0, 0.60, by = 0.01),
+  category_num   = unique(q7_sim_ref$category_num),
+  promo_type_num = round(mean(q7_sim_ref$promo_type_num, na.rm = TRUE)),
+  season_num     = round(mean(q7_sim_ref$season_num, na.rm = TRUE))
+) %>%
+  left_join(
+    q7_sim_ref %>%
+      group_by(category_num) %>%
+      summarise(price = mean(price, na.rm = TRUE),
+                quantity = mean(quantity, na.rm = TRUE), .groups = "drop"),
+    by = "category_num"
+  ) %>%
+  drop_na()
+
+sim_preds <- predict(
+  xgb_q7_model,
+  xgb.DMatrix(data = as.matrix(discount_sim_grid[, q7_features]))
+)
+
+discount_sim_grid$predicted_margin <- sim_preds
+
+# Gắn tên category để vẽ chart
+cat_decoder <- q7_sim_ref %>%
+  distinct(category, category_num)
+
+discount_sim_plot <- discount_sim_grid %>%
+  left_join(cat_decoder, by = "category_num")
+
+# Tìm optimal discount per category
+optimal_discount_per_cat <- discount_sim_plot %>%
+  group_by(category) %>%
+  slice_max(predicted_margin, n = 1) %>%
+  ungroup() %>%
+  select(category, optimal_discount_rate = discount_rate,
+         max_predicted_margin = predicted_margin)
+
+cat("=== OPTIMAL DISCOUNT RATE PER CATEGORY ===\n")
+print(optimal_discount_per_cat)
+
+# Profit curve by category
+discount_sim_plot %>%
+  ggplot(aes(x = discount_rate, y = predicted_margin, color = category)) +
+  geom_line(linewidth = 1, alpha = 0.9) +
+  geom_vline(data = optimal_discount_per_cat,
+             aes(xintercept = optimal_discount_rate, color = category),
+             linetype = "dashed", linewidth = 0.7) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title    = "Profit Curve: Predicted Net Margin vs Discount Rate (by Category)",
+    subtitle = "Đường đứt = Optimal Discount Rate (điểm đỉnh lợi nhuận của từng category)",
+    x        = "Discount Rate",
+    y        = "Predicted Net Margin / đơn",
+    color    = "Category"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### 3c. SHAP Values — Tại sao model ra quyết định vậy?
+
+```{r q7_pred_3, echo=FALSE}
+library(SHAPforxgboost)
+
+X_q7_train <- as.matrix(xgb_q7_train[, q7_features])
+
+shap_q7_long <- shap.prep(
+  xgb_model = xgb_q7_model,
+  X_train   = X_q7_train
+)
+
+shap.plot.summary(shap_q7_long) +
+  labs(
+    title    = "SHAP: Tác động của từng biến lên Net Margin (Q7 Model)",
+    subtitle = "Đỏ = biến cao | Xanh = biến thấp | Trục X = hướng tác động đến Margin",
+    x        = "SHAP Value (impact on Net Margin)",
+    y        = "Feature"
+  ) +
+  theme_minimal()
+
+# SHAP dependence plot: discount_rate → margin
+shap.plot.dependence(
+  data_long = shap_q7_long,
+  x         = "discount_rate",
+  color_feature = "price"
+) +
+  labs(
+    title = "SHAP Dependence: discount_rate → Net Margin",
+    subtitle = "Màu = price level | Điểm inflection = optimal region"
+  ) +
+  theme_minimal()
+```
+
+### 3d. Polynomial Regression — Đường cong profit tổng thể
+
+```{r q7_pred_4, echo=FALSE}
+library(marginaleffects)
+
+# GLM poly để tìm peak analytically
+q7_glm <- lm(
+  net_margin ~ poly(discount_rate, 3) + category + season + log(price + 1),
+  data = df_3_normal %>% filter(has_promo == "1") %>% drop_na(discount_rate, net_margin)
+)
+
+cat("=== GLM Summary ===\n")
+cat("R-squared:", round(summary(q7_glm)$r.squared, 4), "\n")
+
+# Marginal effect curve
+plot_predictions(q7_glm, condition = "discount_rate") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  scale_x_continuous(labels = scales::percent) +
+  labs(
+    title    = "Marginal Effect: Predicted Net Margin theo Discount Rate",
+    subtitle = "Đường đỏ = break-even | Đỉnh cong = mức giảm giá tối ưu",
+    x        = "Discount Rate",
+    y        = "Predicted Net Margin"
+  ) +
+  theme_minimal()
+
+# Tìm analytical optimal từ GLM
+opt_grid <- data.frame(
+  discount_rate = seq(0, 0.60, by = 0.005),
+  category      = names(sort(table(df_3_normal$category), decreasing = TRUE))[1],
+  season        = "Year-End",
+  price         = median(df_3_normal$price, na.rm = TRUE)
+)
+
+opt_grid$predicted_margin <- predict(q7_glm, newdata = opt_grid)
+glm_optimal <- opt_grid %>% slice_max(predicted_margin, n = 1)
+
+cat("\n=== GLM Optimal Discount Rate (Overall) ===\n")
+cat("Optimal Discount Rate:", scales::percent(glm_optimal$discount_rate), "\n")
+cat("Predicted Net Margin at optimal:", scales::comma(round(glm_optimal$predicted_margin, 2)), "\n")
+```
+
+------------------------------------------------------------------------
+
+## IV. Prescriptive — Personalized Promo Strategy
+
+### 4a. Rebuild RFM từ df_2_FIXED — Customer_Type (Whale/Core/Non-Core) + 11 Segments
+
+```{r q7_presc_1, echo=FALSE}
+# ── BƯỚC 1: Load & prep df_2 (mirror y hệt EDA_Q2.Rmd) ──────────────────────
+df_2 <- read.csv("D:/Downloads/Datathon/df_2_FIXED.csv") %>%
+  mutate(
+    order_date          = as.Date(order_date),
+    signup_date         = as.Date(signup_date),
+    revenue             = (quantity * unit_price) - discount_amount,
+    is_promo            = ifelse(is.na(promo_id) | promo_id == "", 0, 1),
+    order_source        = ifelse(order_source == "paid_se", "paid_search", order_source),
+    acquisition_channel = ifelse(acquisition_channel == "paid_se",
+                                 "paid_search", acquisition_channel)
+  ) %>%
+  filter(order_status == "delivered")
+
+max_date_q2 <- max(df_2$order_date, na.rm = TRUE)
+
+# ── BƯỚC 2: Tính R, F, M cho toàn bộ customer ────────────────────────────────
+# Mirror object I3customer_base_full từ EDA_Q2
+I3customer_base_full_q3 <- df_2 %>%
+  group_by(customer_id) %>%
+  summarise(
+    Recency   = as.numeric(difftime(max_date_q2 + lubridate::days(1),
+                                    max(order_date), units = "days")),
+    Frequency = n_distinct(order_id),
+    Monetary  = sum(revenue, na.rm = TRUE),
+    AOV       = Monetary / n_distinct(order_id),
+    .groups   = "drop"
+  )
+
+# ── BƯỚC 3: Xác định ngưỡng 99% để tách Whale ────────────────────────────────
+# Mirror logic EDA_Q2: dùng p99 của F và M
+p99_F_q2 <- quantile(I3customer_base_full_q3$Frequency, 0.99, na.rm = TRUE)
+p99_M_q2 <- quantile(I3customer_base_full_q3$Monetary,  0.99, na.rm = TRUE)
+
+# ── BƯỚC 4: Tách Whales — không chấm điểm RFM, gán thẳng Customer_Type ───────
+# Mirror object whales từ EDA_Q2
+whales_q3 <- I3customer_base_full_q3 %>%
+  filter(Frequency > p99_F_q2 | Monetary > p99_M_q2) %>%
+  mutate(
+    R_Score      = NA_integer_,
+    F_Score      = NA_integer_,
+    M_Score      = NA_integer_,
+    FM_Score     = NA_integer_,
+    Customer_Type = "Whale/B2B",
+    Segment      = "Whale"
+  )
+
+# ── BƯỚC 5: Chấm điểm RFM cho normal customers (99% còn lại) ─────────────────
+# Mirror object normal_customers từ EDA_Q2
+# Dùng ntile(4) như EDA_Q2 cho Customer_Type Core/Non-Core
+# Dùng ntile(5) cho Segment 11 nhóm (scale 1–5 như rfm_raw trong EDA_Q2)
+normal_customers_q3 <- I3customer_base_full_q3 %>%
+  filter(Frequency <= p99_F_q2, Monetary <= p99_M_q2) %>%
+  mutate(
+    # Điểm 4-level cho Customer_Type (giống EDA_Q2 dùng ntile 4)
+    R_4 = ntile(desc(Recency), 4),
+    F_4 = ntile(Frequency, 4),
+    M_4 = ntile(Monetary, 4),
+    Customer_Type = ifelse(R_4 >= 3 & F_4 >= 3 & M_4 >= 3, "Core", "Non-Core"),
+
+    # Điểm 5-level cho 11 Segments (giống rfm_raw trong EDA_Q2)
+    R_Score  = ntile(desc(Recency), 5),
+    F_Score  = ntile(Frequency, 5),
+    M_Score  = ntile(Monetary, 5),
+    FM_Score = round((F_Score + M_Score) / 2),
+    Segment  = case_when(
+      R_Score == 5 & FM_Score >= 4                        ~ "Champions",
+      R_Score %in% c(3,4) & FM_Score >= 4                 ~ "Loyal Customers",
+      R_Score %in% c(1,2) & FM_Score > 4                  ~ "Can't Lose Them",
+      R_Score %in% c(4,5) & FM_Score == 3                 ~ "Potential Loyalist",
+      R_Score == 3 & FM_Score == 3                        ~ "Needs Attention",
+      R_Score %in% c(1,2) & FM_Score %in% c(3,4)         ~ "At Risk",
+      R_Score %in% c(1,2) & FM_Score %in% c(1,2)         ~ "Lost",
+      R_Score == 3 & FM_Score %in% c(1,2)                 ~ "About To Sleep",
+      R_Score == 4 & FM_Score == 1                        ~ "Promising",
+      R_Score %in% c(4,5) & FM_Score == 2                 ~ "Recent Users",
+      R_Score == 5 & FM_Score == 1                        ~ "Price Sensitive",
+      TRUE                                                 ~ "Others"
+    )
+  ) %>%
+  select(-R_4, -F_4, -M_4)  # bỏ cột tạm, giữ output gọn
+
+# ── BƯỚC 6: Gộp lại thành bảng RFM hoàn chỉnh ────────────────────────────────
+# Mirror object rfm_final từ EDA_Q2
+rfm_final_q3 <- bind_rows(normal_customers_q3, whales_q3)
+
+# ── Kiểm tra phân phối ────────────────────────────────────────────────────────
+cat("=== Customer_Type Distribution ===\n")
+rfm_final_q3 %>%
+  count(Customer_Type) %>%
+  mutate(pct = scales::percent(n / sum(n), accuracy = 0.1)) %>%
+  print()
+
+cat("\n=== 11-Segment Distribution (non-Whale) ===\n")
+rfm_final_q3 %>%
+  filter(Customer_Type != "Whale/B2B") %>%
+  count(Segment) %>%
+  arrange(desc(n)) %>%
+  mutate(pct = scales::percent(n / sum(n), accuracy = 0.1)) %>%
+  print()
+```
+
+### 4b. Ghép RFM (Customer_Type + Segment) vào df_3 → phân tích promo behavior
+
+```{r q7_presc_2, echo=FALSE}
+# Merge: customer_id là link giữa rfm_final_q3 (có cả Customer_Type + Segment)
+# và df_3 (promo behavior)
+df_3_rfm <- df_3 %>%
+  left_join(
+    rfm_final_q3 %>% select(customer_id, Customer_Type, Segment,
+                              R_Score, F_Score, M_Score, FM_Score),
+    by = "customer_id"
+  )
+
+# ── Promo behavior tổng theo Customer_Type (Whale / Core / Non-Core) ──────────
+customertype_promo <- df_3_rfm %>%
+  filter(!is.na(Customer_Type)) %>%
+  group_by(Customer_Type) %>%
+  summarise(
+    n_customers      = n_distinct(customer_id),
+    promo_usage_rate = mean(has_promo == "1", na.rm = TRUE),
+    avg_discount_rate = mean(discount_rate[has_promo == "1"], na.rm = TRUE),
+    avg_net_margin   = mean(net_margin[has_promo == "1"], na.rm = TRUE),
+    roi_promo        = sum(net_margin[has_promo == "1"], na.rm = TRUE) /
+                       pmax(sum(discount_amount[has_promo == "1"], na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+cat("=== Promo ROI by Customer_Type ===\n")
+print(customertype_promo)
+
+# ── Promo usage & performance by 11 Segment (non-Whale) ──────────────────────
+rfm_promo_behavior <- df_3_rfm %>%
+  filter(!is.na(Segment), Customer_Type != "Whale/B2B") %>%
+  group_by(Segment) %>%
+  summarise(
+    n_customers       = n_distinct(customer_id),
+    promo_usage_rate  = mean(has_promo == "1", na.rm = TRUE),
+    avg_discount_rate = mean(discount_rate[has_promo == "1"], na.rm = TRUE),
+    avg_net_margin    = mean(net_margin[has_promo == "1"], na.rm = TRUE),
+    avg_aov_promo     = mean(gross_revenue[has_promo == "1"], na.rm = TRUE),
+    avg_aov_nopromo   = mean(gross_revenue[has_promo == "0"], na.rm = TRUE),
+    roi_promo         = sum(net_margin[has_promo == "1"], na.rm = TRUE) /
+                        pmax(sum(discount_amount[has_promo == "1"], na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  drop_na(Segment)
+
+rfm_promo_behavior %>%
+  arrange(desc(roi_promo)) %>%
+  gt() %>%
+  tab_header(
+    title    = md("**Promo ROI theo RFM Segment**"),
+    subtitle = "Segment nào thực sự convert tốt khi nhận promo?"
+  ) %>%
+  fmt_percent(columns = c(promo_usage_rate, avg_discount_rate), decimals = 1) %>%
+  fmt_number(columns = c(avg_net_margin, avg_aov_promo, avg_aov_nopromo, roi_promo), 
+             decimals = 0, use_seps = TRUE) %>%
+  data_color(columns = roi_promo, palette = c("#E24B4A", "white", "#1D9E75"))
+```
+
+### 4c. Recommendation Engine — Promo Recipe theo từng Segment
+
+```{r q7_presc_3, echo=FALSE}
+# Kéo optimal discount rate đã tìm được ở 3b
+overall_optimal_dr <- glm_optimal$discount_rate
+
+# Segment-level optimal discount (từ XGBoost simulation)
+# Loại Whale ra: Whale có AOV quá lớn → làm lệch optimal rate nếu gộp chung
+seg_optimal <- df_3_rfm %>%
+  filter(has_promo == "1", !is.na(Segment), Customer_Type != "Whale/B2B") %>%
+  group_by(Segment) %>%
+  summarise(
+    avg_discount_used    = mean(discount_rate, na.rm = TRUE),
+    avg_net_margin_promo = mean(net_margin, na.rm = TRUE),
+    roi                  = sum(net_margin, na.rm = TRUE) / 
+                           pmax(sum(discount_amount, na.rm = TRUE), 1),
+    n                    = n(),
+    .groups = "drop"
+  )
+
+# Business rule engine: mapping segment → promo recipe
+promo_recipe <- rfm_promo_behavior %>%
+  left_join(seg_optimal %>% select(Segment, roi, avg_discount_used), by = "Segment") %>%
+  mutate(
+    # Định nghĩa promo strategy dựa theo segment + observed ROI + optimal rate
+    recommended_discount = case_when(
+      Segment == "Champions"       ~ 0,                        # Không cần discount
+      Segment == "Loyal Customers" ~ min(overall_optimal_dr * 0.5, 0.05),  # Tặng nhẹ
+      Segment == "Can't Lose Them" ~ overall_optimal_dr,        # Dùng mức tối ưu
+      Segment == "Potential Loyalist" ~ overall_optimal_dr * 0.7,
+      Segment == "Needs Attention" ~ overall_optimal_dr,
+      Segment == "At Risk"         ~ overall_optimal_dr,        # Mức tối ưu kéo lại
+      Segment == "Price Sensitive" ~ overall_optimal_dr * 1.1,  # Hơi cao hơn vì price-driven
+      Segment == "Recent Users"    ~ overall_optimal_dr * 0.6,
+      Segment == "Promising"       ~ overall_optimal_dr * 0.8,
+      Segment == "About To Sleep"  ~ overall_optimal_dr * 0.9,
+      Segment == "Lost"            ~ overall_optimal_dr * 1.2,  # Win-back: push cao hơn
+      TRUE ~ overall_optimal_dr
+    ),
+    promo_type_rec = case_when(
+      Segment == "Champions"        ~ "Freeship / Early Access / VIP Event",
+      Segment == "Loyal Customers"  ~ "Loyalty Points x2 hoặc Freeship",
+      Segment == "Can't Lose Them"  ~ paste0("Discount ", scales::percent(overall_optimal_dr, accuracy=1), " + tặng kèm"),
+      Segment == "Potential Loyalist" ~ "Percentage Discount + Free trial tier cao hơn",
+      Segment == "Needs Attention"  ~ "Reminder email + Limited-time Discount",
+      Segment == "At Risk"          ~ paste0("Win-back campaign: Discount ", scales::percent(overall_optimal_dr, accuracy=1)),
+      Segment == "Price Sensitive"  ~ "Flash Sale ngắn hạn — KHÔNG chạy dài ngày",
+      Segment == "Recent Users"     ~ "Welcome discount nhẹ — nurture thành Loyal",
+      Segment == "Promising"        ~ "Kích thêm 1 đơn: Limited bundle offer",
+      Segment == "About To Sleep"   ~ "Re-engagement email + Soft discount",
+      Segment == "Lost"             ~ "Win-back: Discount mạnh, 1 lần, có hạn",
+      TRUE ~ "Standard Promo"
+    ),
+    priority = case_when(
+      Segment %in% c("Can't Lose Them", "At Risk", "Champions") ~ "🔴 Cao",
+      Segment %in% c("Loyal Customers", "Needs Attention", "Potential Loyalist") ~ "🟡 Trung bình",
+      TRUE ~ "🟢 Thấp"
+    )
+  ) %>%
+  select(Segment, n_customers, promo_usage_rate, roi, 
+         recommended_discount, promo_type_rec, priority) %>%
+  drop_na(Segment) %>%
+  arrange(priority)
+
+promo_recipe %>%
+  gt() %>%
+  tab_header(
+    title    = md("**Promo Playbook: Chiến lược tối ưu theo RFM Segment**"),
+    subtitle  = md(paste0(
+      "Optimal Discount Rate tổng thể (GLM): **",
+      scales::percent(overall_optimal_dr, accuracy = 0.1), "**"
+    ))
+  ) %>%
+  fmt_percent(columns = c(promo_usage_rate, recommended_discount), decimals = 1) %>%
+  fmt_number(columns = roi, decimals = 2) %>%
+  fmt_number(columns = n_customers, use_seps = TRUE, decimals = 0) %>%
+  data_color(columns = roi, palette = c("#E24B4A", "white", "#1D9E75")) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(rows = priority == "🔴 Cao")
+  ) %>%
+  cols_label(
+    Segment            = "RFM Segment",
+    n_customers        = "# Customers",
+    promo_usage_rate   = "Promo Usage Rate",
+    roi                = "Promo ROI",
+    recommended_discount = "Rec. Discount",
+    promo_type_rec     = "Recommended Promo Type",
+    priority           = "Priority"
+  )
+
+# ── Bảng riêng cho Whale/B2B (không dùng discount standard) ──────────────────
+whale_promo_summary <- df_3_rfm %>%
+  filter(Customer_Type == "Whale/B2B") %>%
+  summarise(
+    n_customers       = n_distinct(customer_id),
+    promo_usage_rate  = mean(has_promo == "1", na.rm = TRUE),
+    avg_net_margin    = mean(net_margin[has_promo == "1"], na.rm = TRUE),
+    roi_promo         = sum(net_margin[has_promo == "1"], na.rm = TRUE) /
+                        pmax(sum(discount_amount[has_promo == "1"], na.rm = TRUE), 1),
+    .groups           = "drop"
+  ) %>%
+  mutate(
+    Segment            = "Whale/B2B",
+    recommended_action = "KHÔNG áp discount dạng % — đàm phán hợp đồng B2B riêng hoặc tặng kèm dịch vụ (dedicated support, priority shipping)",
+    priority           = "🔴 Cao (revenue lớn, không nên để rời)"
+  )
+
+cat("\n=== Whale/B2B Strategy ===\n")
+print(whale_promo_summary)
+```
+
+### 4d. Budget Allocation Matrix — Phân bổ ngân sách Promo tối ưu
+
+```{r q7_presc_4, echo=FALSE}
+# Estimated incremental margin gain nếu apply recommended_discount
+budget_matrix <- df_3_rfm %>%
+  filter(!is.na(Segment), Customer_Type != "Whale/B2B") %>%
+  group_by(Segment) %>%
+  summarise(
+    n_customers     = n_distinct(customer_id),
+    total_orders    = n(),
+    avg_aov         = mean(gross_revenue, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(promo_recipe %>% select(Segment, recommended_discount, priority), 
+            by = "Segment") %>%
+  mutate(
+    # Estimated discount cost nếu apply rec discount toàn bộ segment
+    est_discount_cost = avg_aov * recommended_discount * total_orders,
+    # Giả định: mỗi 1% giảm giá → volume tăng |ε| * 1%
+    # Dùng elasticity đã tính ở phần 2a (global ε)
+    est_volume_uplift = recommended_discount * abs(elas_summary$elasticity[1]),
+    est_incremental_rev = avg_aov * est_volume_uplift * n_customers,
+    est_net_gain = est_incremental_rev - est_discount_cost,
+    roi_est = ifelse(est_discount_cost > 0, 
+                     est_incremental_rev / est_discount_cost, NA)
+  ) %>%
+  arrange(desc(est_net_gain))
+
+budget_matrix %>%
+  gt() %>%
+  tab_header(
+    title    = md("**Budget Allocation Matrix**"),
+    subtitle = "Ưu tiên ngân sách promo cho segment có Est. Net Gain cao nhất"
+  ) %>%
+  fmt_percent(columns = recommended_discount, decimals = 1) %>%
+  fmt_number(columns = c(avg_aov, est_discount_cost, est_incremental_rev, est_net_gain),
+             decimals = 0, use_seps = TRUE) %>%
+  fmt_number(columns = roi_est, decimals = 2) %>%
+  data_color(columns = est_net_gain,
+             palette = c("#E24B4A", "white", "#1D9E75"))
+```
+
+------------------------------------------------------------------------
+
+# TỔNG THỂ DATASET — Predictive & Prescriptive
+
+------------------------------------------------------------------------
+
+## I. Overall Predictive — Dự báo Revenue xu hướng tương lai
+
+### P1. Time-Series Forecasting: Doanh thu tổng thể (ARIMA + ETS)
+
+```{r overall_pred_1, echo=FALSE}
+library(forecast)
+library(tseries)
+
+# Tạo monthly time-series
+monthly_rev <- df_3 %>%
+  mutate(order_month = floor_date(order_date, "month")) %>%
+  group_by(order_month) %>%
+  summarise(total_revenue = sum(gross_revenue, na.rm = TRUE), .groups = "drop") %>%
+  arrange(order_month)
+
+rev_ts <- ts(monthly_rev$total_revenue,
+             start     = c(year(min(monthly_rev$order_month)),
+                           month(min(monthly_rev$order_month))),
+             frequency = 12)
+
+# ADF Test: kiểm tra stationarity
+adf_result <- tseries::adf.test(rev_ts)
+cat("=== ADF Test (Stationarity) ===\n")
+cat("p-value:", round(adf_result$p.value, 4),
+    "→", ifelse(adf_result$p.value < 0.05, "Stationary ✓", "Non-stationary → cần diff"), "\n")
+
+# Auto ARIMA
+arima_model <- auto.arima(rev_ts, stepwise = FALSE, approximation = FALSE,
+                           seasonal = TRUE, trace = FALSE)
+
+cat("\n=== Best ARIMA Model ===\n")
+print(summary(arima_model))
+
+# Forecast 12 tháng tới
+arima_fc <- forecast(arima_model, h = 12)
+
+autoplot(arima_fc) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "ARIMA Forecast: Doanh thu 12 tháng tới",
+    subtitle = paste0("Model: ARIMA", paste0("(", paste(arima_model$arma[c(1,6,2,3,7,4,5)], 
+                                                         collapse=","), ")")),
+    x        = "Thời gian",
+    y        = "Total Revenue"
+  ) +
+  theme_minimal()
+
+# ETS comparison
+ets_model <- ets(rev_ts)
+ets_fc    <- forecast(ets_model, h = 12)
+
+cat("\n=== ETS Model ===\n")
+cat("Model selected:", ets_model$method, "\n")
+
+# Compare ARIMA vs ETS
+comparison_fc <- data.frame(
+  Month        = seq(max(monthly_rev$order_month) %m+% months(1),
+                     by = "month", length.out = 12),
+  ARIMA_mean   = as.numeric(arima_fc$mean),
+  ARIMA_lo80   = as.numeric(arima_fc$lower[,1]),
+  ARIMA_hi80   = as.numeric(arima_fc$upper[,1]),
+  ETS_mean     = as.numeric(ets_fc$mean)
+)
+
+comparison_fc %>%
+  pivot_longer(cols = c(ARIMA_mean, ETS_mean), names_to = "model", values_to = "forecast") %>%
+  ggplot(aes(x = Month, y = forecast, color = model)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(data = comparison_fc,
+              aes(x = Month, ymin = ARIMA_lo80, ymax = ARIMA_hi80),
+              inherit.aes = FALSE, alpha = 0.15, fill = "#4A90E2") +
+  scale_y_continuous(labels = scales::comma) +
+  scale_color_manual(values = c("ARIMA_mean" = "#4A90E2", "ETS_mean" = "#EF9F27")) +
+  labs(
+    title    = "ARIMA vs ETS Forecast — 12 tháng",
+    subtitle = "Vùng xanh = 80% confidence interval của ARIMA",
+    x        = "Tháng",
+    y        = "Predicted Revenue",
+    color    = "Model"
+  ) +
+  theme_minimal()
+```
+
+### P2. XGBoost — Dự báo Revenue theo đơn hàng (Feature-rich)
+
+```{r overall_pred_2, echo=FALSE}
+# Multi-feature revenue prediction (toàn dataset, không chỉ promo)
+q_overall_xgb_df <- df_3_normal %>%
+  mutate(
+    category_num    = as.numeric(as.factor(category)),
+    promo_type_num  = as.numeric(as.factor(promo_type)),
+    season_num      = as.numeric(as.factor(season)),
+    source_num      = as.numeric(as.factor(order_source)),
+    has_promo_num   = as.numeric(as.character(has_promo)),
+    is_stacked_num  = as.numeric(as.character(is_stacked))
+  ) %>%
+  select(gross_revenue, discount_rate, price, quantity, category_num,
+         promo_type_num, season_num, source_num,
+         has_promo_num, is_stacked_num, month, year) %>%
+  drop_na()
+
+set.seed(99)
+overall_idx   <- createDataPartition(q_overall_xgb_df$gross_revenue, p = 0.8, list = FALSE)
+overall_train <- q_overall_xgb_df[overall_idx, ]
+overall_test  <- q_overall_xgb_df[-overall_idx, ]
+
+overall_features <- c("discount_rate", "price", "quantity", "category_num",
+                       "promo_type_num", "season_num", "source_num",
+                       "has_promo_num", "is_stacked_num", "month", "year")
+
+dtrain_ov <- xgb.DMatrix(
+  data  = as.matrix(overall_train[, overall_features]),
+  label = overall_train$gross_revenue
+)
+dtest_ov <- xgb.DMatrix(
+  data  = as.matrix(overall_test[, overall_features]),
+  label = overall_test$gross_revenue
+)
+
+xgb_overall <- xgb.train(
+  params = list(
+    objective        = "reg:squarederror",
+    eta              = 0.05,
+    max_depth        = 6,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data                  = dtrain_ov,
+  nrounds               = 600,
+  watchlist             = list(val = dtest_ov),
+  early_stopping_rounds = 30,
+  print_every_n         = 100,
+  verbose               = 1
+)
+
+# Predicted vs Actual
+overall_preds <- predict(xgb_overall, dtest_ov)
+overall_actuals <- overall_test$gross_revenue
+
+rmse_val <- sqrt(mean((overall_preds - overall_actuals)^2))
+r2_val   <- cor(overall_preds, overall_actuals)^2
+
+cat("\n=== Overall Revenue Model Performance ===\n")
+cat("RMSE:", scales::comma(round(rmse_val, 0)), "\n")
+cat("R²:  ", round(r2_val, 4), "\n")
+
+# Predicted vs Actual scatter
+data.frame(actual = overall_actuals, predicted = overall_preds) %>%
+  sample_n(min(5000, nrow(.))) %>%
+  ggplot(aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.2, color = "#4A90E2", size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "XGBoost: Predicted vs Actual Revenue",
+    subtitle = paste0("R² = ", round(r2_val, 4), " | RMSE = ", scales::comma(round(rmse_val, 0))),
+    x        = "Actual Gross Revenue",
+    y        = "Predicted Gross Revenue"
+  ) +
+  theme_minimal()
+
+# Feature importance tổng thể
+overall_imp <- xgb.importance(feature_names = overall_features, model = xgb_overall)
+xgb.plot.importance(overall_imp, rel_to_first = TRUE,
+                    main = "Feature Importance: Drivers của Doanh thu tổng thể",
+                    col  = "#1D9E75")
+```
+
+### P3. Customer Churn Prediction — Khách nào sắp rời đi?
+
+```{r overall_pred_3, echo=FALSE}
+# Dùng RFM scores để predict churn (Recency > 180 ngày = at risk)
+max_date_df3 <- max(df_3$order_date, na.rm = TRUE)
+
+churn_base <- df_3 %>%
+  group_by(customer_id) %>%
+  summarise(
+    last_order_date    = max(order_date, na.rm = TRUE),
+    total_orders       = n_distinct(order_id),
+    total_spend        = sum(gross_revenue - discount_amount, na.rm = TRUE),
+    avg_discount_rate  = mean(discount_rate, na.rm = TRUE),
+    promo_usage_rate   = mean(has_promo == "1", na.rm = TRUE),
+    avg_net_margin     = mean(net_margin, na.rm = TRUE),
+    recency_days       = as.numeric(difftime(max_date_df3, max(order_date), units = "days")),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    is_churned = as.factor(ifelse(recency_days > 180, 1, 0))
+  )
+
+cat("=== Churn Rate ===\n")
+cat("Churned (>180 ngày):", sum(churn_base$is_churned == "1"), 
+    "(", scales::percent(mean(churn_base$is_churned == "1")), ")\n")
+cat("Active:              ", sum(churn_base$is_churned == "0"), "\n")
+
+# Train churn model
+churn_ml <- churn_base %>%
+  select(is_churned, total_orders, total_spend, avg_discount_rate,
+         promo_usage_rate, avg_net_margin, recency_days) %>%
+  drop_na()
+
+set.seed(42)
+churn_idx   <- createDataPartition(churn_ml$is_churned, p = 0.8, list = FALSE)
+churn_train <- churn_ml[churn_idx, ]
+churn_test  <- churn_ml[-churn_idx, ]
+
+churn_rf <- ranger(
+  is_churned ~ .,
+  data             = churn_train,
+  num.trees        = 500,
+  importance       = "permutation",
+  probability      = TRUE,
+  classification   = FALSE
+)
+
+# Churn probability on test set
+churn_prob <- predict(churn_rf, churn_test)$predictions[, 2]
+churn_pred <- ifelse(churn_prob > 0.5, "1", "0")
+
+# Confusion matrix
+cm <- confusionMatrix(
+  factor(churn_pred, levels = c("0","1")),
+  factor(churn_test$is_churned, levels = c("0","1")),
+  positive = "1"
+)
+cat("\n=== Churn Model Performance ===\n")
+print(cm$overall[c("Accuracy","Kappa")])
+print(cm$byClass[c("Sensitivity","Specificity","Precision","F1")])
+
+# Feature importance: tại sao churn?
+churn_vip <- data.frame(
+  variable   = names(churn_rf$variable.importance),
+  importance = churn_rf$variable.importance
+) %>% arrange(desc(importance))
+
+ggplot(churn_vip, aes(x = reorder(variable, importance), y = importance)) +
+  geom_col(fill = "#E24B4A", alpha = 0.85) +
+  coord_flip() +
+  labs(
+    title    = "Churn Model: Yếu tố nào dự báo khách rời đi?",
+    subtitle = "Permutation importance từ Random Forest",
+    x        = "Feature",
+    y        = "Importance"
+  ) +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+## II. Overall Prescriptive — Tối ưu Chiến lược Kinh doanh Tổng thể
+
+### S1. BCG Matrix: Category Portfolio
+
+```{r overall_presc_1, echo=FALSE}
+# Tính market share tương đối và growth rate theo category
+category_perf <- df_3 %>%
+  mutate(period = ifelse(year >= 2019, "recent", "past")) %>%
+  group_by(category, period) %>%
+  summarise(total_revenue = sum(gross_revenue, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = period, values_from = total_revenue, values_fill = 0) %>%
+  mutate(
+    growth_rate    = (recent - past) / pmax(past, 1),
+    market_share   = recent / sum(recent)
+  )
+
+# BCG quadrant thresholds
+median_growth <- median(category_perf$growth_rate, na.rm = TRUE)
+median_share  <- median(category_perf$market_share, na.rm = TRUE)
+
+category_perf %>%
+  mutate(
+    bcg_quadrant = case_when(
+      growth_rate >= median_growth & market_share >= median_share ~ "⭐ Stars",
+      growth_rate <  median_growth & market_share >= median_share ~ "🐄 Cash Cows",
+      growth_rate >= median_growth & market_share <  median_share ~ "❓ Question Marks",
+      TRUE ~ "🐕 Dogs"
+    )
+  ) %>%
+  ggplot(aes(x = market_share, y = growth_rate,
+             size = recent, color = bcg_quadrant, label = category)) +
+  geom_point(alpha = 0.8) +
+  ggrepel::geom_text_repel(size = 3.5, fontface = "bold") +
+  geom_vline(xintercept = median_share,  linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = median_growth, linetype = "dashed", color = "gray50") +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_size_continuous(range = c(4, 18), guide = "none") +
+  scale_color_manual(values = c(
+    "⭐ Stars"          = "#F39C12",
+    "🐄 Cash Cows"      = "#2ECC71",
+    "❓ Question Marks" = "#3498DB",
+    "🐕 Dogs"           = "#E74C3C"
+  )) +
+  labs(
+    title    = "BCG Matrix: Category Portfolio",
+    subtitle = "Trục X: Market Share (recent) | Trục Y: Revenue Growth | Size: Revenue",
+    x        = "Relative Market Share",
+    y        = "Revenue Growth Rate (past → recent)",
+    color    = "BCG Quadrant"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### S2. Ansoff Matrix — Growth Strategy
+
+```{r overall_presc_2, echo=FALSE}
+library(ggplot2)
+
+# Visualize Ansoff framework với data context
+ansoff_data <- data.frame(
+  quadrant    = c("Market Penetration\n(Hiện tại × Hiện tại)",
+                  "Product Development\n(Mới × Hiện tại)",
+                  "Market Development\n(Hiện tại × Mới)",
+                  "Diversification\n(Mới × Mới)"),
+  x_center    = c(1, 3, 1, 3),
+  y_center    = c(1, 1, 3, 3),
+  strategy    = c(
+    "• Tối ưu promo cho Core Customers\n• Tăng frequency mua lại\n• Cross-sell trong cùng category",
+    "• Ra mắt SKU mới trong category Stars\n• Cải thiện margin qua COGS\n• Expand size/color variants",
+    "• Mở rộng kênh acquisition mới\n• Target zip code chưa khai thác\n• Expand segment Streetwear",
+    "• Explore category hoàn toàn mới\n• Partnership với brand ngoài\n• B2B / Wholesale channel"
+  ),
+  risk        = c("Thấp", "Trung bình", "Trung bình", "Cao"),
+  fill_color  = c("#2ECC71", "#F39C12", "#3498DB", "#E74C3C")
+)
+
+ggplot(ansoff_data) +
+  geom_tile(aes(x = x_center, y = y_center, fill = fill_color),
+            width = 1.9, height = 1.9, color = "white", linewidth = 2) +
+  geom_text(aes(x = x_center, y = y_center + 0.5, label = quadrant),
+            fontface = "bold", size = 3.8, color = "white") +
+  geom_text(aes(x = x_center, y = y_center - 0.1, label = strategy),
+            size = 2.5, color = "white", lineheight = 1.3) +
+  scale_fill_identity() +
+  scale_x_continuous(breaks = c(1,3), labels = c("Sản phẩm\nHiện tại", "Sản phẩm\nMới")) +
+  scale_y_continuous(breaks = c(1,3), labels = c("Thị trường\nHiện tại", "Thị trường\nMới")) +
+  labs(
+    title    = "Ansoff Growth Matrix — Chiến lược Tăng trưởng",
+    subtitle = "Mapping findings từ Q6, Q7, Q3-Q5 lên framework lựa chọn chiến lược",
+    x        = "Sản phẩm",
+    y        = "Thị trường"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text      = element_text(size = 11, face = "bold"),
+    plot.title     = element_text(size = 14, face = "bold"),
+    panel.grid     = element_blank(),
+    axis.ticks     = element_blank()
+  )
+```
+
+### S3. Promo Rationalization — Kill/Optimize/Keep Decision
+
+```{r overall_presc_3, echo=FALSE}
+# Cải tiến promo_decision từ Q6 bằng cách bổ sung elasticity context
+final_promo_decision <- promo_decision %>%
+  left_join(
+    df_3 %>%
+      filter(has_promo == "1") %>%
+      group_by(promo_name) %>%
+      summarise(
+        avg_discount_rate = mean(discount_rate, na.rm = TRUE),
+        category_top      = names(sort(table(category), decreasing = TRUE))[1],
+        .groups = "drop"
+      ),
+    by = "promo_name"
+  ) %>%
+  mutate(
+    # Kết hợp ROI + recommendation để ra quyết định cuối
+    final_action = case_when(
+      recommendation == "KILL — destroys margin"                       ~ "🔴 KILL",
+      recommendation == "KEEP — positive ROI" & promo_roi > 2          ~ "🟢 SCALE UP",
+      recommendation == "KEEP — positive ROI"                          ~ "🟢 KEEP",
+      recommendation == "OPTIMIZE — thin margin" & avg_discount_rate > overall_optimal_dr ~ "🟡 CUT DISCOUNT",
+      TRUE                                                              ~ "🟡 A/B TEST"
+    )
+  ) %>%
+  select(promo_name, promo_type, n_orders, total_gross_rev, total_net_margin,
+         promo_roi, avg_discount_rate, recommendation, final_action) %>%
+  arrange(promo_roi)
+
+final_promo_decision %>%
+  gt() %>%
+  tab_header(
+    title    = md("**Final Promo Rationalization Decision**"),
+    subtitle = md(paste0(
+      "Based on ROI + Elasticity-adjusted Optimal Discount (",
+      scales::percent(overall_optimal_dr, accuracy=0.1), ")"
+    ))
+  ) %>%
+  fmt_number(columns = c(total_gross_rev, total_net_margin, n_orders), 
+             decimals = 0, use_seps = TRUE) %>%
+  fmt_percent(columns = avg_discount_rate, decimals = 1) %>%
+  fmt_number(columns = promo_roi, decimals = 2) %>%
+  data_color(columns = promo_roi, palette = c("#E24B4A", "white", "#1D9E75")) %>%
+  tab_style(
+    style     = cell_fill(color = "#FDECEA"),
+    locations = cells_body(rows = final_action == "🔴 KILL")
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#EAF7EF"),
+    locations = cells_body(rows = final_action == "🟢 SCALE UP")
+  )
+```
+
+### S4. Executive Summary Dashboard — 1 trang tổng kết
+
+```{r overall_presc_4, echo=FALSE}
+library(patchwork)
+
+# KPI summary cards thay bằng plots đơn giản
+kpi_data <- tibble(
+  metric = c("Total Revenue", "Total Promo Cost", "Promo ROI\n(Overall)", 
+             "Optimal Discount", "% Unprofitable\nPromo Orders"),
+  value  = c(
+    sum(df_3$gross_revenue, na.rm = TRUE),
+    sum(df_3$discount_amount, na.rm = TRUE),
+    sum(df_3$net_margin[df_3$has_promo == "1"], na.rm = TRUE) /
+      pmax(sum(df_3$discount_amount[df_3$has_promo == "1"], na.rm = TRUE), 1),
+    overall_optimal_dr,
+    mean(df_3$net_margin[df_3$has_promo == "1"] < 0, na.rm = TRUE)
+  ),
+  format = c("comma", "comma", "ratio", "pct", "pct"),
+  color  = c("#4A90E2", "#E24B4A", "#2ECC71", "#F39C12", "#E74C3C")
+)
+
+kpi_data %>%
+  mutate(
+    label = case_when(
+      format == "comma" ~ scales::comma(round(value, 0)),
+      format == "pct"   ~ scales::percent(value, accuracy = 0.1),
+      TRUE              ~ as.character(round(value, 2))  # <-- thêm as.character()
+    )
+  ) %>%
+  ggplot(aes(x = reorder(metric, -value), y = 1, fill = color)) +
+  geom_tile(color = "white", linewidth = 2, width = 0.95, height = 0.95) +
+  geom_text(aes(label = label), fontface = "bold", size = 6, color = "white") +
+  geom_text(aes(y = 0.6, label = metric), size = 3.2, color = "white", lineheight = 1.2) +
+  scale_fill_identity() +
+  coord_fixed() +
+  labs(title = "Executive KPI Dashboard — Promo Performance Overview") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5))
+```
+
+### S5. Action Roadmap — Timeline thực thi 90 ngày
+
+```{r overall_presc_5, echo=FALSE}
+roadmap <- data.frame(
+  Phase   = c(rep("Phase 1 (Tháng 1): Quick Wins", 3),
+              rep("Phase 2 (Tháng 2): Optimization", 3),
+              rep("Phase 3 (Tháng 3): Scale & Monitor", 3)),
+  Action  = c(
+    # Phase 1
+    "KILL toàn bộ promo ROI < 0 (tiết kiệm chi phí ngay lập tức)",
+    "Cap discount rate tối đa theo optimal rate tìm được",
+    "Disable stackable promo nếu ROI stack < ROI đơn lẻ",
+    # Phase 2
+    "A/B test recommended discount per segment (Champions vs At Risk)",
+    "Triển khai Freeship cho Champions thay discount tiền mặt",
+    "Điều chỉnh promo theo category elasticity (tránh discount category inelastic)",
+    # Phase 3
+    "Scale promo campaign nào A/B test WIN sang toàn bộ segment",
+    "Monthly promo ROI review meeting",
+    "Build live dashboard theo dõi: margin erosion / promo penetration"
+  ),
+  Owner   = c("Promo Team","Promo Team","Tech","Marketing","Marketing",
+               "Category Mgr","Marketing","Leadership","BI Team"),
+  Impact  = c("High","High","Medium","High","Medium","High","High","Medium","Low"),
+  Effort  = c("Low","Low","Medium","Medium","Low","Medium","Low","Low","High")
+)
+
+roadmap %>%
+  gt() %>%
+  tab_header(
+    title    = md("**90-Day Action Roadmap — Promo Optimization**"),
+    subtitle = "Thứ tự ưu tiên: Phase 1 → 2 → 3"
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#EAF7EF"),
+    locations = cells_body(rows = grepl("Phase 1", Phase))
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#FEF9E7"),
+    locations = cells_body(rows = grepl("Phase 2", Phase))
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#EAF2F8"),
+    locations = cells_body(rows = grepl("Phase 3", Phase))
+  ) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(rows = Impact == "High" & Effort == "Low")
+  ) %>%
+  cols_label(
+    Phase  = "Phase",
+    Action = "Action Item",
+    Owner  = "Owner",
+    Impact = "Business Impact",
+    Effort = "Implementation Effort"
+  )
+```

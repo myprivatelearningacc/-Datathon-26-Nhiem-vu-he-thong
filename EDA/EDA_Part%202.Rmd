@@ -1,0 +1,3317 @@
+---
+title: "EDA TRUC 2"
+output: html_document
+date: "2026-04-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(error = TRUE)
+```
+
+# A. DATA WRANGLING
+
+## I. Setup
+
+```{r setup 2,include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(ggplot2)
+library(ggridges)
+library(patchwork)
+library(survival)
+library(survminer)
+library(tidymodels)
+library(xgboost)
+library(vip)
+library(forecast)
+library(knitr)
+library(kableExtra)
+
+df <- read.csv("D:/Downloads/Datathon/df_2_FIXED.csv") %>%
+  mutate(
+    # 1. Đổi ymd thành mdy vì format là Month/Day/Year
+    order_date = mdy(order_date),
+    signup_date = mdy(signup_date),
+    
+    # Tính toán doanh thu
+    revenue = (quantity * unit_price) - discount_amount,
+    
+    # 2. Kiểm tra promo: Nếu promo_id không phải NA và không rỗng thì là có promo
+    # Dùng !is.na() an toàn hơn khi làm việc với read.csv
+    is_promo = ifelse(!is.na(promo_id) & promo_id != "", 1, 0)
+  ) %>%
+  mutate(
+    # Chuẩn hóa tên kênh (nếu có dữ liệu bị cắt cụt)
+    order_source = ifelse(order_source == "paid_se", "paid_search", order_source),
+    acquisition_channel = ifelse(acquisition_channel == "paid_se", "paid_search", acquisition_channel)
+  )
+
+# Kiểm tra lại kết quả
+head(df)
+summary(df$order_date) # Xem có còn NA không
+
+# Chỉ dùng đơn hàng giao thành công cho toàn bộ phân tích hành vi
+df_delivered <- df %>% filter(order_status == "delivered")
+
+```
+
+# Q3: Khách hàng nào là “Core customers”?
+
+## 1. Overview
+
+### 1.1. Customer distribution by Order/Customer
+
+```{r customer distri,echo=FALSE}
+customer_base <- df %>%
+  group_by(customer_id) %>%
+  summarise(
+    total_orders = n_distinct(order_id),
+    total_spend = sum(revenue, na.rm = TRUE)
+  )
+
+# Chart 1: Phân phối số đơn
+ggplot(customer_base, aes(x = total_orders)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Distribution of Orders per Customer", x = "Number of Orders", y = "Count of Customers") +
+  theme_minimal()
+```
+
+### 1.2. Customer distribution by Revenue/Customer
+
+```{r customer spend,echo=FALSE}
+library(scales) 
+
+rev_per_customer <- ggplot(customer_base, aes(x = total_spend)) +
+  geom_histogram(bins = 50, fill = "darkgreen", color = "white", alpha = 0.8) +
+  # Chìa khóa đây: Dùng scales::comma để tắt số "e" và thêm dấu phẩy ngăn cách hàng nghìn
+  scale_x_log10(labels = scales::comma) + 
+  labs(
+    title = "Distribution of Total Spend per Customer",
+    subtitle = "(Logarithmic Scale)",
+    x = "Total Spend", 
+    y = "Number of Customers"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 11)
+  )
+
+library(dplyr)
+
+
+# Bin size là bao nhiu
+plot_data <- ggplot_build(rev_per_customer)
+I2bin_info <- plot_data$data[[1]] %>%
+  select(xmin, xmax, count) %>%
+  mutate(
+    real_min_spend = 10^xmin,         # Mức tiền nhỏ nhất của bin
+    real_max_spend = 10^xmax,         # Mức tiền lớn nhất của bin
+    bin_size = real_max_spend - real_min_spend # Độ rộng thực tế của bin
+  )
+
+View(I2bin_info)
+```
+
+### 1.3. Regency & Timeframe distribution
+
+```{r regency,echo=FALSE}
+# 1. Kiểm tra khung thời gian của Data
+min_date <- min(df$order_date, na.rm = TRUE)
+max_date <- max(df$order_date, na.rm = TRUE)
+cat("Data kéo dài từ:", as.character(min_date), "đến", as.character(max_date), "\n")
+
+# 2. Xem tóm tắt thống kê và các mốc % (Percentiles) để soi Outlier
+quantile(customer_base$total_orders, probs = c(0.5, 0.75, 0.9, 0.95, 0.99))
+quantile(customer_base$total_spend, probs = c(0.5, 0.75, 0.9, 0.95, 0.99))
+
+# Nếu thấy top 1% (0.99) chênh lệch quá ảo so với 95%, nhớ note lại trong report.
+
+# 3. Thêm bảng base đầy đủ R, F, M, AOV (Giống bảng tao gửi hôm qua)
+I3customer_base_full <- df %>%
+  filter(order_status == "delivered") %>%
+  group_by(customer_id) %>%
+  summarise(
+    Recency = as.numeric(difftime(max_date + days(1), max(order_date), units = "days")),
+    Frequency = n_distinct(order_id),
+    Monetary = sum(revenue, na.rm = TRUE),
+    AOV = Monetary / Frequency
+  )
+
+# Chart: Phân phối của Recency (Khách hàng đã rời đi bao lâu?)
+ggplot(I3customer_base_full, aes(x = Recency)) +
+  geom_histogram(bins = 30, fill = "coral", color = "white") +
+  labs(title = "Distribution of Recency (Days since last purchase)", x = "Days", y = "Count") +
+  theme_minimal()
+```
+
+### 1.4. AOV Distribution
+
+```{r aov,echo=FALSE}
+ggplot(I3customer_base_full, aes(x = AOV)) +
+  geom_histogram(bins = 50, fill = "purple", color = "white", alpha = 0.7) +
+  scale_x_log10(labels = scales::comma) +
+  labs(title = "Distribution of Average Order Value (AOV)", x = "AOV (Log Scale)", y = "Count") +
+  theme_minimal()
+```
+
+### 1.5. Finding outliers
+
+```{r outliers,echo=FALSE}
+library(ggplot2)
+library(scales)
+
+# Chart 2.1: Boxplot soi Số đơn (Frequency)
+ggplot(customer_base, aes(y = total_orders)) +
+  geom_boxplot(fill = "lightblue", color = "darkblue", 
+               outlier.color = "red", outlier.size = 3, outlier.alpha = 0.6) +
+  theme_minimal() +
+  labs(
+    title = "Outliers: Order/Customer", 
+    y = "Total Orders (Số đơn/khách)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_blank(), # Ẩn trục X cho đỡ vướng
+    axis.ticks.x = element_blank()
+  )
+
+# Chart 2.2: Boxplot soi Chi tiêu (Monetary)
+ggplot(customer_base, aes(y = total_spend)) +
+  geom_boxplot(fill = "lightgreen", color = "darkgreen", 
+               outlier.color = "red", outlier.size = 3, outlier.alpha = 0.6) +
+  scale_y_continuous(labels = scales::comma) + # Format số tiền
+  theme_minimal() +
+  labs(
+    title = "Outliers: Spending/Customer", 
+    y = "Total Spend (Tổng tiền/khách)",
+  ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+#Chart 3: Pareto
+# 1. Tính toán số liệu tích lũy cho Pareto
+I5pareto_data <- customer_base %>%
+  # Loại bỏ mấy ông doanh thu âm hoặc bằng 0 (nếu có)
+  filter(total_spend > 0) %>% 
+  # Sắp xếp từ đại gia xuống
+  arrange(desc(total_spend)) %>%
+  mutate(
+    # Tính số thứ tự của khách hàng
+    row_num = row_number(),
+    # Cộng dồn tiền
+    cum_spend = cumsum(total_spend),
+    # Quy ra % số khách hàng
+    pct_customers = (row_num / n()) * 100,
+    # Quy ra % doanh thu
+    pct_spend = (cum_spend / sum(total_spend)) * 100
+  )
+
+# 2. Lấy tọa độ tại mốc 20% khách hàng xem nó tương ứng với bao nhiêu % tiền
+point_20 <- I5pareto_data %>% filter(pct_customers >= 20) %>% slice(1)
+y_val <- round(point_20$pct_spend, 1) # Lấy số % doanh thu tại mốc 20% khách
+
+# 3. Vẽ biểu đồ Pareto Curve
+ggplot(I5pareto_data, aes(x = pct_customers, y = pct_spend)) +
+  # Đường cong Pareto
+  geom_line(color = "darkred", size = 1.2) +
+  # Tô màu vùng dưới đường cong cho đẹp
+  geom_area(fill = "pink", alpha = 0.3) +
+  
+  # Kẻ 2 đường dóng xuống để thấy tỷ lệ 80/20 (hoặc tỷ lệ thực tế của data)
+  geom_vline(xintercept = 20, linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = y_val, linetype = "dashed", color = "gray50") +
+  
+  # Chấm điểm và ghi chú tại mốc 20% khách hàng
+  geom_point(x = 20, y = y_val, color = "blue", size = 4) +
+  annotate("text", x = 22, y = y_val - 5, 
+           label = paste0("Top 20% khách\nmang lại ", y_val, "% doanh thu"), 
+           hjust = 0, color = "blue", fontface = "bold") +
+  
+  # Format các trục
+  scale_x_continuous(breaks = seq(0, 100, 10), labels = function(x) paste0(x, "%")) +
+  scale_y_continuous(breaks = seq(0, 100, 10), labels = function(x) paste0(x, "%")) +
+  labs(
+    title = "Pareto Chart: Revenue by Customers",
+    subtitle = "Đa số doanh thu đến từ một nhóm nhỏ khách hàng",
+    x = "Phần trăm lượng Khách hàng (Được sắp xếp từ mua nhiều nhất)",
+    y = "Phần trăm Tổng Doanh thu tích lũy"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+## 2. Diagnostic Analysis
+
+### 2.1. RFM Analysis
+
+```{r rfm,include=FALSE}
+# 1. LỌC OUTLIER (CÁ MẬP / B2B)
+# Tính mốc 99% từ bảng I3customer_base_full đã tạo ở phần trước
+p99_F <- quantile(I3customer_base_full$Frequency, 0.99, na.rm = TRUE)
+p99_M <- quantile(I3customer_base_full$Monetary, 0.99, na.rm = TRUE)
+
+# Tách riêng nhóm Cá mập (Top 1% chi tiêu hoặc số đơn)
+whales <- I3customer_base_full %>%
+  filter(Frequency > p99_F | Monetary > p99_M) %>%
+  mutate(
+    R_Score = NA, F_Score = NA, M_Score = NA, # Không chấm điểm nhóm này
+    RFM_Segment = "Whale",
+    Customer_Type = "Whale/B2B"
+  )
+
+# 2. CHIA ĐIỂM RFM CHO TẬP KHÁCH HÀNG CHUẨN (99%)
+normal_customers <- I3customer_base_full %>%
+  filter(Frequency <= p99_F & Monetary <= p99_M) %>%
+  mutate(
+    # ntile(4) chia tập data thành 4 phần đều nhau. R cần xếp ngược (desc) vì càng gần càng tốt.
+    R_Score = ntile(desc(Recency), 4),
+    F_Score = ntile(Frequency, 4),
+    M_Score = ntile(Monetary, 4),
+    RFM_Segment = paste0(R_Score, F_Score, M_Score),
+    
+    # Định nghĩa Core: Điểm R, F, M đều lọt top 50% trở lên (Điểm 3 hoặc 4)
+    Customer_Type = ifelse(R_Score >= 3 & F_Score >= 3 & M_Score >= 3, "Core", "Non-Core")
+  )
+
+# 3. GỘP LẠI THÀNH BẢNG RFM HOÀN CHỈNH
+rfm_final <- bind_rows(normal_customers, whales)
+
+
+# Chart 1 của RFM: Scatter Plot định vị Core vs Non-Core vs Whales
+ggplot(rfm_final, aes(x = Frequency, y = Monetary, color = Customer_Type)) +
+  geom_point(alpha = 0.6, size = 2.5) +
+  # Gán màu có chủ đích: Core màu cam nổi bật, Non-Core xám chìm, Cá mập màu đỏ
+  scale_color_manual(values = c("Core" = "darkorange", "Non-Core" = "gray70", "Whale/B2B" = "firebrick")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Customer Segmentation: Core vs Non-Core vs Whales",
+    subtitle = "Core Customers là nhóm có điểm R, F, M đều >= 3",
+    x = "Total Orders (Frequency)",
+    y = "Total Spend (Monetary)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom",
+    legend.title = element_blank()
+  )
+
+# Chart 2 của RFM: Kiểm chứng sức mạnh của Core Customer (Pareto version 2)
+# Tính tổng doanh thu và số lượng khách theo từng nhóm
+core_contribution <- rfm_final %>%
+  group_by(Customer_Type) %>%
+  summarise(
+    Total_Customers = n(),
+    Total_Revenue = sum(Monetary, na.rm = TRUE)
+  ) %>%
+  mutate(
+    Pct_Customers = (Total_Customers / sum(Total_Customers)) * 100,
+    Pct_Revenue = (Total_Revenue / sum(Total_Revenue)) * 100
+  )
+
+# Chuyển data dạng dài (long format) để vẽ Bar chart song song
+core_contribution_long <- core_contribution %>%
+  tidyr::pivot_longer(cols = c(Pct_Customers, Pct_Revenue), 
+                      names_to = "Metric", values_to = "Percentage") %>%
+  mutate(Metric = ifelse(Metric == "Pct_Customers", "% of Total Customers", "% of Total Revenue"))
+
+# Vẽ Bar Chart so sánh
+ggplot(core_contribution_long, aes(x = Customer_Type, y = Percentage, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.9) +
+  geom_text(aes(label = paste0(round(Percentage, 1), "%")), 
+            position = position_dodge(width = 0.9), vjust = -0.5, fontface = "bold") +
+  scale_fill_manual(values = c("% of Total Customers" = "steelblue", "% of Total Revenue" = "darkorange")) +
+  labs(
+    title = "Business Impact of Core Customers",
+    subtitle = "So sánh tỷ lệ phần trăm số lượng người và phần trăm doanh thu mang lại",
+    x = "Customer Segment",
+    y = "Percentage (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "top",
+    legend.title = element_blank()
+  )
+
+#Kiểm chứng assumption: Hành vi của Core vs. WHale
+library(dplyr)
+
+# Join lại bảng rfm_final (có nhãn Whales/Core) với data gốc df
+df_behavior_check <- rfm_final %>%
+  select(customer_id, Customer_Type) %>%
+  inner_join(df, by = "customer_id")
+
+# Phân tích so sánh hành vi sâu
+whale_vs_core <- df_behavior_check %>%
+  filter(Customer_Type %in% c("Whale/B2B", "Core")) %>%
+  group_by(Customer_Type) %>%
+  summarise(
+    # Trung bình 1 dòng sản phẩm họ mua mấy cái?
+    Avg_Quantity_Per_Item = mean(quantity, na.rm = TRUE),
+    
+    # Kỷ lục mua nhiều nhất 1 món là bao nhiêu cái?
+    Max_Quantity_Per_Item = max(quantity, na.rm = TRUE),
+    
+    # Tỷ lệ dùng mã giảm giá
+    Promo_Usage_Rate = mean(is_promo, na.rm = TRUE)
+  )
+
+print(whale_vs_core)
+```
+
+#### Alternative: Dùng package rfm (sẽ hơi nhiều nhóm)(đã bỏ qua 1% outlier)
+
+--\> Takeaway: Tự thiết kế matrix is better
+
+```{r package,include=FALSE}
+
+library(rfm)
+library(dplyr)
+library(lubridate)
+
+# ==========================================
+# BƯỚC 1: LỌC BỎ OUTLIER (SUPER VIP) TỪ DATA GỐC
+# ==========================================
+
+# Tính lại mốc 99% (Nếu mày đã chạy ở trên rồi thì thôi, tao cứ để đây cho chắc)
+p99_F <- quantile(I3customer_base_full$Frequency, 0.99, na.rm = TRUE)
+p99_M <- quantile(I3customer_base_full$Monetary, 0.99, na.rm = TRUE)
+
+# Lấy ra danh sách ID của tụi Super VIP
+super_vip_ids <- I3customer_base_full %>%
+  filter(Frequency > p99_F | Monetary > p99_M) %>%
+  pull(customer_id) # Dùng pull để rút cái cột này thành 1 list ID
+
+# Tạo data SẠCH (Chỉ chứa 99% khách hàng chuẩn) để đưa vào package
+df_rfm_clean <- df %>%
+  filter(order_status == "delivered") %>%
+  filter(!customer_id %in% super_vip_ids) %>% # CÚ CHỐT: Bỏ mặt tụi Super VIP ra khỏi đây
+  select(customer_id, order_date, revenue)
+
+# ==========================================
+# BƯỚC 2: CHẠY PACKAGE NHƯ BÌNH THƯỜNG
+# ==========================================
+
+analysis_date <- max(df_rfm_clean$order_date, na.rm = TRUE) + days(1)
+
+# Đưa df_rfm_clean vào chạy thuật toán (Lúc này đường cong điểm đã được bảo vệ)
+report <- rfm_table_order(
+  data = df_rfm_clean,
+  customer_id = customer_id,
+  order_date = order_date,
+  revenue = revenue,
+  analysis_date = analysis_date
+)
+# 4. ĐỊNH NGHĨA 10 PHÂN KHÚC Y HỆT TUTORIAL
+segment_titles <- c("First Grade", "Loyal", "Likely to be Loyal",
+                    "New Ones", "Could be Promising", "Require Assistance", 
+                    "Getting Less Frequent", "Almost Out", "Can't Lose Them", 
+                    "Don’t Show Up at All")
+
+r_low <- c(4, 2, 3, 4, 3, 2, 2, 1, 1, 1)
+r_high <- c(5, 5, 5, 5, 4, 3, 3, 2, 1, 2)
+f_low <- c(4, 3, 1, 1, 1, 2, 1, 2, 4, 1)
+f_high <- c(5, 5, 3, 1, 1, 3, 2, 5, 5, 2)
+m_low <- c(4, 3, 1, 1, 1, 2, 1, 2, 4, 1)
+m_high <- c(5, 5, 3, 1, 1, 3, 2, 5, 5, 2)
+
+divisions <- rfm_segment(report, segment_titles, r_low, r_high, f_low, f_high, m_low, m_high)
+
+# Bảng thống kê số lượng khách từng phân khúc
+segment_counts <- divisions %>% 
+  count(segment) %>% 
+  arrange(desc(n)) %>% 
+  rename(Segment = segment, Count = n)
+
+print(segment_counts)
+
+# ==========================================
+# 5. VẼ TOÀN BỘ CHART TỪ TUTORIAL
+# ==========================================
+
+# Chart 1: R Median (Biểu đồ vạch ra trung vị số ngày chưa mua của từng nhóm)
+rfm_plot_median_recency(divisions)
+
+# Chart 2: F Median (Biểu đồ trung vị số đơn hàng của từng nhóm)
+rfm_plot_median_frequency(divisions)
+
+# Chart 3: M Median (Biểu đồ trung vị mức chi tiêu của từng nhóm)
+rfm_plot_median_monetary(divisions)
+
+#CHart 4: Historgram
+rfm_data_plot <- report$rfm %>%
+  # Chỉ lấy 3 cột cần thiết
+  select(recency_days, transaction_count, amount) %>%
+  # Đổi tên cho đẹp để lát nó hiện lên tiêu đề từng biểu đồ nhỏ
+  rename(
+    Recency = recency_days,
+    Frequency = transaction_count,
+    Monetary = amount
+  ) %>%
+  # Kéo dài data: gom 3 cột thành 2 cột (Metric và Value)
+  pivot_longer(cols = everything(), names_to = "Metric", values_to = "Value")
+
+# View(rfm_data_plot) # Mày có thể mở ra xem nếu muốn
+
+# Bước 2: Vẽ bằng ggplot2 + facet_wrap (ĐÃ FIX LỖI FREQUENCY)
+ggplot(rfm_data_plot, aes(x = Value, fill = Metric)) +
+  
+  # Lớp 1: Chỉ vẽ cho Recency và Monetary (Vẫn xài bins = 30 như cũ)
+  geom_histogram(data = filter(rfm_data_plot, Metric != "Frequency"), 
+                 bins = 30, color = "white", alpha = 0.8) +
+  
+  # Lớp 2: Phép thuật ở đây! Chỉ vẽ RIÊNG cho Frequency với binwidth = 1 và boundary = 0.5
+  geom_histogram(data = filter(rfm_data_plot, Metric == "Frequency"), 
+                 binwidth = 1, boundary = 0.5, color = "white", alpha = 0.8) +
+  
+  # Dòng ma thuật: chia làm 3 biểu đồ dựa vào cột Metric
+  facet_wrap(~ Metric, scales = "free", ncol = 3) + 
+  
+  # Chọn màu cho 3 biểu đồ nhìn cho rực rỡ
+  scale_fill_manual(values = c("Recency" = "#FF9999", "Frequency" = "#66B2FF", "Monetary" = "#99FF99")) +
+  
+  # Trang trí thêm cho chuẩn báo cáo
+  theme_minimal() +
+  labs(
+    title = "RFM Distribution", 
+    x = "Value", 
+    y = "Count"
+  ) +
+  theme(
+    legend.position = "none", # Tắt ghi chú màu bên phải vì không cần thiết
+    strip.text = element_text(face = "bold", size = 12), # In đậm chữ Recency, Frequency, Monetary
+    plot.title = element_text(face = "bold", size = 14)
+  )
+# Chart 5: Bar Plot for Orders (Phân phối số lượng khách hàng theo số đơn)
+rfm_plot_order_dist(report)
+
+# Bonus Chart cực xịn của package rfm: Heatmap và Scatter plot
+library(ggplot2)
+library(dplyr)
+
+# BƯỚC 1: TÍNH ĐIỂM F&M VÀ LÀM DATA CHO HEATMAP
+rfm_matrix_data <- report$rfm %>%
+  mutate(
+    # Trục Y: Trung bình cộng của F và M (làm tròn để ra các mốc nguyên 1, 2, 3, 4, 5)
+    FM_Score = round((frequency_score + monetary_score) / 2)
+  ) %>%
+  # Gom nhóm theo tọa độ X (R_score) và Y (FM_Score) để đếm số lượng khách hàng
+  group_by(recency_score, FM_Score) %>%
+  summarise(
+    Count = n(),
+    Avg_Spend = mean(amount), # Có thể xài để đổi màu nếu thích
+    .groups = 'drop'
+  )
+
+# BƯỚC 2: VẼ SIÊU PHẨM HEATMAP (R VS F&M) CÓ GẮN SỐ LƯỢNG
+ggplot(rfm_matrix_data, aes(x = as.factor(recency_score), y = as.factor(FM_Score), fill = Count)) +
+  # Vẽ các ô vuông gạch caro
+  geom_tile(color = "white", size = 1) +
+  
+  # ĐÂY CHÍNH LÀ ĐIỀU MÀY MUỐN: Điền con số khách hàng vào chính giữa từng ô
+  geom_text(aes(label = Count), color = "black", fontface = "bold", size = 5) +
+  
+  # Đổ màu dải nhiệt (Từ trắng nhạt sang đỏ sậm tùy số lượng khách)
+  scale_fill_gradient(low = "#FFE0B2", high = "#E65100") +
+  
+  # Trang trí cho giống cái hình mẫu mày gửi
+  theme_minimal() +
+  labs(
+    title = "Predictive Segments Heatmap (R vs F&M)",
+    subtitle = "Trục X: Độ gần đây (Recency) | Trục Y: Tần suất & Tiền (Frequency & Monetary)",
+    x = "Recency Score (Càng cao càng mới mua)",
+    y = "F&M Score (Càng cao càng mua nhiều & chi đậm)",
+    fill = "Số Khách"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.title = element_text(face = "bold"),
+    panel.grid = element_blank() # Bỏ mấy cái viền nhạt nhẽo đi
+  )
+rfm_plot_bar_chart(report)
+```
+
+#### Tô màu thành 11 nhóm như học Marketing
+
+```{r final RFM,echo=FALSE}
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+# ==========================================
+# BƯỚC 1: TÍNH TỔNG SỐ KHÁCH HÀNG TỪNG NHÓM TỪ DATA GỐC
+# ==========================================
+rfm_raw <- report$rfm %>%
+  mutate(FM_Score = round((frequency_score + monetary_score) / 2)) %>%
+  mutate(
+    Segment = case_when(
+      recency_score == 5 & FM_Score >= 4 ~ "Champions",
+      recency_score %in% c(3, 4) & FM_Score >= 4 ~ "Loyal Customers",
+      recency_score %in% c(1, 2) & FM_Score > 4 ~ "Can't Lose Them",
+      (recency_score == 4 & FM_Score ==3) | (recency_score == 5 & FM_Score == 3) ~ "Potential Loyalist",
+      recency_score == 3 & FM_Score == 3 ~ "Needs Attention",
+      recency_score %in% c(1, 2) & FM_Score %in% c(3,4) ~ "Hibernating",
+      recency_score %in% c(1, 2) & FM_Score %in% c(1,2) ~ "Lost",
+      recency_score == 3 & FM_Score %in% c(1, 2) ~ "About To Sleep",
+      recency_score == 4 & FM_Score == 1 ~ "Promising",
+      recency_score %in% c(4, 5) & FM_Score == 2 ~ "Recent Users",
+      recency_score == 5 & FM_Score == 1 ~ "Price Sensitive",
+      TRUE ~ "Others" 
+    )
+  )
+
+# Lấy tổng số liệu cho cả nhóm (không chia theo từng ô)
+segment_totals <- rfm_raw %>%
+  group_by(Segment) %>%
+  summarise(Total_Count = n(), .groups = 'drop') %>%
+  mutate(Pct = Total_Count / sum(Total_Count))
+
+# ==========================================
+# BƯỚC 2: TẠO BẢN ĐỒ 5X5 VÀ TỌA ĐỘ LABEL
+# ==========================================
+# Ép vẽ đủ 25 ô cho dù có ô bị trống khách hàng
+grid_5x5 <- expand.grid(recency_score = 1:5, FM_Score = 1:5) %>%
+  mutate(
+    Segment = case_when(
+      recency_score == 5 & FM_Score >= 4 ~ "Champions",
+      recency_score %in% c(3, 4) & FM_Score >= 4 ~ "Loyal Customers",
+      recency_score %in% c(1, 2) & FM_Score > 4 ~ "Can't Lose Them",
+      (recency_score == 4 & FM_Score ==3) | (recency_score == 5 & FM_Score == 3) ~ "Potential Loyalist",
+      recency_score == 3 & FM_Score == 3 ~ "Needs Attention",
+      recency_score %in% c(1, 2) & FM_Score %in% c(3,4) ~ "Hibernating",
+      recency_score %in% c(1, 2) & FM_Score %in% c(1,2) ~ "Lost",
+      recency_score == 3 & FM_Score %in% c(1, 2) ~ "About To Sleep",
+      recency_score == 4 & FM_Score == 1 ~ "Promising",
+      recency_score %in% c(4, 5) & FM_Score == 2 ~ "Recent Users",
+      recency_score == 5 & FM_Score == 1 ~ "Price Sensitive",
+      TRUE ~ "Others" 
+    )
+  ) %>%
+  # Ghép số tổng của cả nhóm vào từng ô
+  left_join(segment_totals, by = "Segment") %>%
+  mutate(Total_Count = coalesce(Total_Count, 0), Pct = coalesce(Pct, 0))
+
+# Tìm tọa độ trung tâm để dán Label
+label_data <- grid_5x5 %>%
+  group_by(Segment, Total_Count, Pct) %>%
+  summarise(
+    center_x = mean(recency_score),
+    center_y = mean(FM_Score),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    # Định dạng Label: Tên Nhóm \n Số Lượng \n (Phần trăm)
+    Label_Text = paste0(Segment, "\n", comma(Total_Count), "\n(", percent(Pct, accuracy = 0.1), ")")
+  )
+
+# ==========================================
+# BƯỚC 3: VẼ MATRIX CÓ GRADIENT VÀ MERGED LABEL
+# ==========================================
+ggplot() +
+  # Lớp 1: Vẽ 25 ô vuông, đổ màu gradient dựa theo TỔNG SỐ của NHÓM ĐÓ
+  geom_tile(data = grid_5x5, aes(x = recency_score, y = FM_Score, fill = Total_Count), color = NA, linewidth = 0.5) +
+  
+  # Đổ màu Gradient: Ít khách = Đỏ, Vừa = Vàng, Nhiều khách = Xanh lá
+  scale_fill_gradientn(
+    colors = c("#06D6A0","#FFD166","#FF4B4B"), 
+    labels = comma # Format chú thích màu bên phải cho có dấu phẩy
+  ) +
+  
+  # Lớp 2: Gắn chữ vào đúng tọa độ trung tâm của mỗi nhóm (1 nhóm chỉ có 1 cục chữ)
+  geom_text(data = label_data, aes(x = center_x, y = center_y, label = Label_Text), 
+            color = "black", fontface = "bold", size = 3.5, lineheight = 0.9) +
+  
+  # Ép trục hiển thị đúng 1,2,3,4,5
+  scale_x_continuous(breaks = 1:5, expand = c(0,0)) +
+  scale_y_continuous(breaks = 1:5, expand = c(0,0)) +
+  
+  theme_minimal() +
+  labs(
+    title = "Predictive Segments Matrix (Heatmap)",
+    subtitle = "Màu sắc thể hiện quy mô của từng phân khúc (Đỏ: Ít - Xanh lá: Nhiều)",
+    x = "Recency Score",
+    y = "Frequency & Monetary Score",
+    fill = "Tổng KH"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.title = element_text(face = "bold"),
+    panel.grid = element_blank(), # Tắt lưới vì đã có viền của geom_tile
+    legend.position = "right",
+    aspect.ratio = 0.5 # Giữ matrix vuông vắn
+  )
+```
+
+### 2.2. Phân tích đa chiều
+
+#### 2.2.1. Product Diversity & Tenure per Customer
+
+```{r q3_diagnostic_addition, echo=FALSE, message=FALSE, warning=FALSE}
+customer_behavior <- df_delivered %>%
+  group_by(customer_id) %>%
+  summarise(
+    tenure_days = as.numeric(difftime(max(order_date), min(order_date), units = "days")),
+    n_unique_products = n_distinct(product_id),
+    total_discount = sum(discount_amount, na.rm = TRUE),
+    total_revenue = sum(revenue, na.rm = TRUE)
+  ) %>%
+  mutate(
+    discount_dependency = ifelse(total_revenue > 0, total_discount / total_revenue, 0)
+  )
+
+# Gộp với rfm_final
+rfm_behavior <- rfm_final %>%
+  left_join(customer_behavior, by = "customer_id")
+
+# Chart: Độ phụ thuộc vào Khuyến mãi của Core vs Non-Core
+ggplot(rfm_behavior %>% filter(Customer_Type %in% c("Core", "Non-Core")), 
+       aes(x = Customer_Type, y = discount_dependency, fill = Customer_Type)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.1) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Discount Dependency: Core vs Non-Core",
+       subtitle = "Core Customers có mua hàng vì giảm giá nhiều bằng Non-Core không?",
+       y = "% Doanh thu đến từ Giảm giá") +
+  theme_minimal()
+```
+
+#### 2.2.2. RFM x Demographics
+
+--\> Không có gì
+
+```{r rfm demo,include=FALSE}
+demo_check <- rfm_final %>%
+  left_join(df %>% distinct(customer_id, age_group), by = "customer_id") %>%
+  filter(!is.na(age_group)) %>%
+  count(Customer_Type, age_group) %>%
+  group_by(Customer_Type) %>%
+  mutate(pct = n / sum(n))
+
+ggplot(demo_check, aes(x = Customer_Type, y = pct, fill = age_group)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Demographic Mix by Customer Segment", y = "Percentage") +
+  theme_minimal()
+```
+
+## 3. Predictive
+
+```{r q3_predictive_ml, echo=FALSE, message=FALSE, warning=FALSE}
+library(factoextra)
+library(tidymodels)
+library(xgboost)
+
+# --- 1. K-MEANS CLUSTERING ---
+# Scale data để K-means không bị lệch bởi Monetary
+rfm_for_kmeans <- rfm_final %>%
+  filter(Customer_Type != "Whale/B2B") %>% # Tạm bỏ cá mập
+  select(customer_id, Recency, Frequency, Monetary) %>%
+  drop_na()
+
+rfm_scaled <- scale(rfm_for_kmeans[, 2:4])
+
+# Vẽ Elbow (Bạn có thể chạy fviz_nbclust để xem K tối ưu, ở đây giả định K=4 hoặc 5)
+set.seed(123)
+km_res <- kmeans(rfm_scaled, centers = 4, nstart = 25)
+rfm_for_kmeans$KMeans_Cluster <- as.factor(km_res$cluster)
+
+# --- 2. CHURN PREDICTION (HƯỚNG DẪN ML WORKFLOW) ---
+# Định nghĩa Churn: Không mua trong 180 ngày so với max_date
+analysis_date_ml <- max(df_delivered$order_date)
+ml_data <- rfm_behavior %>%
+  filter(Customer_Type != "Whale/B2B") %>%
+  mutate(
+    days_since_last = as.numeric(difftime(analysis_date_ml, max_date + days(1) - Recency, units="days")),
+    is_churned = as.factor(ifelse(Recency > 180, "Yes", "No"))
+  ) %>%
+  select(is_churned, Frequency, Monetary, AOV, tenure_days, n_unique_products, discount_dependency) %>%
+  drop_na()
+
+# Chia tập Train/Test
+set.seed(456)
+data_split <- initial_split(ml_data, prop = 0.8, strata = is_churned)
+train_data <- training(data_split)
+
+# Cấu hình XGBoost đơn giản (Dành cho báo cáo EDA)
+xgb_spec <- boost_tree(trees = 100) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_fit <- xgb_spec %>%
+  fit(is_churned ~ ., data = train_data)
+
+# Trực quan hóa Feature Importance (Cái gì làm khách hàng Churn?)
+library(vip)
+vip(xgb_fit, geom = "col") +
+  ggplot2::geom_col(fill = "darkred") +
+  theme_minimal() +
+  labs(
+    title = "Top Feature Importance for Customer Churn",
+    subtitle = "Chỉ số nào quyết định việc khách hàng rời bỏ?"
+  )
+```
+
+## 4. Prescriptive cho RFM
+
+### 4.1. Next Action từ RFM
+
+```{r prescriptive_nba, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(kableExtra)
+
+# 1. Tạo bảng Next-Best-Action dựa trên Data thực tế từ rfm_raw (đã tạo ở bước diagnostic)
+nba_matrix <- rfm_raw %>%
+  group_by(Segment) %>%
+  summarise(
+    Total_Customers = n(),
+    Avg_Recency_Days = round(mean(recency_days), 0),
+    Avg_Spend = round(mean(amount), 0),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    # ĐỀ XUẤT CHIẾN LƯỢC DỰA TRÊN ĐẶC TÍNH DATA
+    Strategy_Action = case_when(
+      Segment %in% c("Champions", "Loyal Customers") ~ "Giữ chân bằng Đặc quyền (Early access, VIP Care). KHÔNG lạm dụng giảm giá sâu.",
+      Segment %in% c("Potential Loyalist", "Promising") ~ "Tăng Tần suất (Frequency) bằng Bundle sản phẩm hoặc Miễn phí vận chuyển.",
+      Segment %in% c("Can't Lose Them", "Hibernating") ~ "Win-back khẩn cấp: Cử Telesale/Gửi Email cá nhân hóa kèm Voucher giá trị cao.",
+      Segment == "Price Sensitive" ~ "Chỉ target quảng cáo khi có chương trình Xả hàng (Clearance Sale).",
+      Segment %in% c("Lost", "Don’t Show Up at All") ~ "Ngừng chi tiền Ads. Đưa vào tệp Email tự động (Zero-cost nurturing).",
+      TRUE ~ "Duy trì Auto-Marketing (Voucher sinh nhật, Lễ tết)."
+    )
+  ) %>%
+  arrange(desc(Avg_Spend))
+
+# 2. Hiển thị bảng đẹp mắt
+kable(nba_matrix, format = "html", escape = FALSE, 
+      col.names = c("Phân Khúc", "Số lượng KH", "Trung bình ngày vắng mặt", "Chi tiêu TB", "Hành động Đề xuất (Prescriptive)"),
+      caption = "Bảng Chiến lược Hành động (Next-Best-Action) theo Từng Phân Khúc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  column_spec(5, width = "400px", bold = TRUE, color = "white", background = "#2C3E50")
+```
+
+### 4.2. Tối ưu hóa Ngân sách Kênh Thu hút (Budget Re-allocation)
+
+```{r prescriptive_budget, echo=FALSE, message=FALSE, warning=FALSE}
+# 1. Tính toán Kênh nào "Sản xuất" ra tỷ lệ Core cao nhất
+channel_core_rate <- df_delivered %>%
+  distinct(customer_id, acquisition_channel) %>%
+  inner_join(rfm_final %>% select(customer_id, Customer_Type), by = "customer_id") %>%
+  filter(!is.na(acquisition_channel) & acquisition_channel != "") %>%
+  group_by(acquisition_channel) %>%
+  summarise(
+    Total_Acquired = n(),
+    Core_Generated = sum(Customer_Type == "Core"),
+    Whale_Generated = sum(Customer_Type == "Whale/B2B"),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    # Tỷ lệ ra Core & Whale
+    Premium_Rate = (Core_Generated + Whale_Generated) / Total_Acquired
+  )
+
+# 2. Xây dựng Rule Tối ưu Ngân sách (Data-Driven, không giả định)
+budget_allocation <- channel_core_rate %>%
+  mutate(
+    # Rule: Top 25% kênh xịn nhất -> Tăng ngân sách. Bottom 25% -> Cắt giảm.
+    Budget_Recommendation = case_when(
+      Premium_Rate >= quantile(Premium_Rate, 0.75) ~ "Tỷ lệ ra Core/Whales tốt (>75%)",
+      Premium_Rate <= quantile(Premium_Rate, 0.25) ~ "Tỷ lệ ra Core/Whales thấp (<25%)",
+      TRUE ~ Theo dõi thêm"
+    )
+  ) %>%
+  arrange(desc(Premium_Rate)) %>%
+  select(acquisition_channel, Total_Acquired, Premium_Rate, Budget_Recommendation) %>%
+  mutate(Premium_Rate = scales::percent(Premium_Rate, accuracy = 0.1))
+
+# 3. Trực quan hóa Khuyến nghị
+ggplot(budget_allocation, aes(x = reorder(acquisition_channel, Premium_Rate), y = Total_Acquired, fill = Budget_Recommendation)) +
+  geom_col(color = "black") +
+  coord_flip() +
+  scale_fill_manual(values = c("🔥 TĂNG NGÂN SÁCH (Scale Up) - Tỷ lệ ra KH VIP cực tốt" = "#27ae60",
+                               "⚖️ DUY TRÌ (Maintain) - Theo dõi thêm" = "#f39c12",
+                               "✂️ CẮT GIẢM (Cut/Optimize) - Kênh mang về khách hàng rác" = "#c0392b")) +
+  labs(
+    title = "Prescriptive Action: Acquisition Budget Re-allocation",
+    subtitle = "Đề xuất cắt/tăng ngân sách dựa trên Tỷ lệ tạo ra Core Customers của từng kênh",
+    x = "Acquisition Channel",
+    y = "Tổng lượng khách thu hút",
+    fill = "Khuyến nghị Action:"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+
+```
+
+### 4.3. Đề xuất phân bổ khuyến mãi
+
+```{r prescriptive_promo, echo=FALSE, message=FALSE, warning=FALSE}
+# 1. Sử dụng rfm_behavior từ phần Diagnostic của bạn
+promo_strategy <- rfm_behavior %>%
+  filter(Customer_Type %in% c("Core", "Non-Core")) %>%
+  group_by(Customer_Type) %>%
+  summarise(
+    Avg_Discount_Dependency = mean(discount_dependency, na.rm = TRUE),
+    Avg_AOV = mean(AOV, na.rm = TRUE)
+  ) %>%
+  mutate(
+    # Rule Prescriptive: Dựa vào sự phụ thuộc khuyến mãi thực tế của Data
+    Promo_Action = case_when(
+      Avg_Discount_Dependency < 0.1 & Customer_Type == "Core" ~ "KHÔNG MASS DISCOUNT. Nhóm này ít phụ thuộc giá. Tặng quà hiện vật hoặc Loyalty points để bảo vệ biên lợi nhuận (Margin).",
+      Avg_Discount_Dependency >= 0.1 & Customer_Type == "Non-Core" ~ "TARGETED DISCOUNT. Dùng voucher Giảm giá/Freeship để kích thích họ mua lần 2, lần 3 vươn lên thành Core.",
+      TRUE ~ "A/B Testing để đo lường thêm."
+    )
+  )
+
+kable(promo_strategy, format = "html", escape = FALSE,
+      col.names = c("Nhóm KH", "Mức phụ thuộc Khuyến mãi", "AOV Trung bình", "Chiến lược Khuyến mãi Tối ưu"),
+      caption = "Chiến lược Tối ưu Margin dựa trên Sự phụ thuộc Khuyến mãi") %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = F) %>%
+  column_spec(4, bold = TRUE, color = "darkred")
+```
+
+# Q4: Customer lifecycle
+
+### 0. Bảng summary
+
+#### Step 1: Lifecycle data prep
+
+```{r summary-1, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+
+# ── 0A. ĐỊNH NGHĨA NGÀY PHÂN TÍCH ──
+# Lấy ngày mua cuối cùng trong toàn bộ dataset làm mốc hiện tại
+ANALYSIS_DATE <- max(df_delivered$order_date, na.rm = TRUE)
+
+inter_order_delivered <- df_delivered %>%
+  arrange(customer_id, order_date) %>%
+  group_by(customer_id) %>%
+  mutate(
+    order_number = row_number(),
+    Prev_Date    = lag(order_date),
+    Gap_Days     = as.numeric(difftime(order_date, Prev_Date, units = "days"))
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(Gap_Days))
+
+# ── 0B. TẠO LIFECYCLE_BASE ──
+# Bước 1: Tạo bảng phụ tính Gap (Chỉ tính, không lọc khách)
+gap_metrics_temp <- df_delivered %>%
+  distinct(customer_id, order_id, .keep_all = TRUE) %>%
+  arrange(customer_id, order_date) %>%
+  group_by(customer_id) %>%
+  mutate(
+    order_number = row_number(),
+    prev_date    = lag(order_date),
+    gap_val      = as.numeric(difftime(order_date, prev_date, units = "days"))
+  ) %>%
+  summarise(
+    avg_gap    = mean(gap_val, na.rm = TRUE),
+    median_gap = median(gap_val, na.rm = TRUE),
+    # Tính gap_trend y chang logic cũ của mày
+    gap_trend  = ifelse(n() >= 3, 
+                        coef(lm(gap_val ~ order_number))[2], 
+                        0),
+    .groups = "drop"
+  )
+
+# Bước 2: Tạo lifecycle_base từ nguồn tổng và ghép Gap vào
+# Tên object và tên cột được giữ nguyên 100% so với code cũ của mày
+lifecycle_base <- df_delivered %>%
+  group_by(customer_id) %>%
+  summarise(
+    first_order      = min(order_date),
+    last_order       = max(order_date),
+    n_orders         = n_distinct(order_id),
+    total_revenue    = sum(unit_price * quantity, na.rm = TRUE),
+    n_products       = n_distinct(product_id),
+    .groups = "drop"
+  ) %>%
+  # Ghép chỉ số gap vào (ai mua 1 lần sẽ nhận NA, không bị mất dòng)
+  left_join(gap_metrics_temp, by = "customer_id") %>%
+  # Tính nốt các cột thời gian mà code phía dưới của mày cần
+  mutate(
+    tenure_days      = as.numeric(difftime(last_order, first_order, units = "days")),
+    Recency          = as.numeric(difftime(ANALYSIS_DATE, last_order, units = "days")), 
+    cohort_month     = floor_date(first_order, "month"),
+    cohort_year      = year(first_order)
+  )
+
+# ── 0C. TẠO LIFECYCLE_FULL (ALL-IN-ONE) & TÍNH CHURN ĐỘNG ──
+lifecycle_full <- lifecycle_base %>%
+  # 1. Join lấy Nhãn RFM 
+  left_join(
+    rfm_final %>% select(customer_id, Customer_Type),
+    by = "customer_id"
+  ) %>%
+  # 2. Join lấy Demographic & Acquisition Channel 
+  left_join(
+    df %>% 
+      arrange(customer_id, order_date) %>% 
+      distinct(customer_id, .keep_all = TRUE) %>% 
+      select(customer_id, acquisition_channel, age_group, gender), 
+    by = "customer_id"
+  ) %>%
+  left_join(
+    rfm_raw %>% select(customer_id, Segment),
+    by = "customer_id"
+  ) %>%
+  mutate(
+    Dynamic_Threshold = case_when(
+      Customer_Type == "Whale/B2B" ~ 99,
+      Customer_Type == "Core"      ~ 324,
+      Customer_Type == "Non-Core"  ~ 675,
+      TRUE                         ~ 324 # Fallback rule
+    ),
+    is_dynamic_churned = ifelse(Recency > Dynamic_Threshold, 1, 0)
+  )
+
+# ── 0D. TẠO BẢNG INTER-ORDER CHUNG CHO CÁC CHART ──
+inter_order_all <- df_delivered %>%
+  arrange(customer_id, order_date) %>%
+  group_by(customer_id) %>%
+  mutate(
+    order_rank = row_number(),
+    prev_date  = lag(order_date),
+    gap_days   = as.numeric(difftime(order_date, prev_date, units = "days"))
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(gap_days)) %>%
+  left_join(
+    lifecycle_full %>% select(customer_id, Customer_Type, acquisition_channel, age_group, is_dynamic_churned),
+    by = "customer_id"
+  )
+
+# Kiểm tra log
+cat("✓ lifecycle_base       :", nrow(lifecycle_base), "customers\n")
+cat("✓ lifecycle_full       :", nrow(lifecycle_full), "customers\n")
+cat("✓ inter_order_all rows :", nrow(inter_order_all), "gap records\n")
+cat("✓ Total Churned        :", sum(lifecycle_full$is_dynamic_churned, na.rm = TRUE), "/", nrow(lifecycle_full), "\n")
+```
+
+#### Step 2: Summary Table KPI
+
+```{r desc-summary-table-dynamic, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(kableExtra)
+library(tidyr)
+
+# =====================================================================
+# TÍNH BẢNG KPI TỔNG QUAN (ĐÃ CÓ SẴN CHURN ĐỘNG TỪ BƯỚC TRÊN)
+# =====================================================================
+lifecycle_kpi_dynamic <- lifecycle_full %>%
+  summarise(
+    `Total Customers (delivered)`   = n(),
+    `1-time buyers`                 = sum(n_orders == 1, na.rm = TRUE),
+    `% 1-time buyers`               = mean(n_orders == 1, na.rm = TRUE),
+    `Repeat buyers (≥2 orders)`     = sum(n_orders >= 2, na.rm = TRUE),
+    `Median orders/customer`        = median(n_orders, na.rm = TRUE),
+    `Median tenure (days)`          = median(tenure_days, na.rm = TRUE),
+    `Median inter-order gap (days)` = median(avg_gap, na.rm = TRUE),
+    
+    # SỐ LIỆU CHURN ĐỘNG
+    `Churned (Dynamic Rules)`       = sum(is_dynamic_churned, na.rm = TRUE),
+    `% Churned`                     = mean(is_dynamic_churned, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Metric", values_to = "Value") %>%
+  # Format cho số nhìn đẹp hơn
+  mutate(Value = round(Value, 2))
+
+# =====================================================================
+# HIỂN THỊ BẢNG ĐẸP MẮT CHO REPORT
+# =====================================================================
+kable(lifecycle_kpi_dynamic, caption = "Customer Lifecycle — Summary KPIs (Applied Dynamic Churn)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  # Bôi đỏ 2 dòng cuối cùng (Dòng 8, 9) để dằn mặt sếp về tỷ lệ Churn
+  row_spec(8:9, bold = TRUE, color = "white", background = "#E74C3C")
+```
+
+## 1. Descriptive Analytics
+
+### 1.1. Heatmap retention rate
+
+#### Retention Heatmap
+
+```{r yearly_cohort_heatmap, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(scales) 
+
+# BƯỚC 1: LÀM DATA THEO NĂM (YEARLY COHORT)
+cohort_yearly_prep <- df %>%
+  filter(order_status == "delivered") %>% # NHỚ LỌC ĐƠN THÀNH CÔNG
+  group_by(customer_id) %>%
+  mutate(
+    First_Order_Date = min(order_date, na.rm = TRUE),
+    # Gom nhóm theo Năm thay vì Tháng
+    Cohort_Year = year(First_Order_Date),
+    Order_Year = year(order_date),
+    # Index bây giờ là số NĂM kể từ khi mua lần đầu
+    Cohort_Index = Order_Year - Cohort_Year
+  ) %>%
+  ungroup()
+
+# BƯỚC 2: TÍNH RETENTION RATE
+cohort_yearly_data <- cohort_yearly_prep %>%
+  group_by(Cohort_Year, Cohort_Index) %>%
+  summarise(Users = n_distinct(customer_id), .groups = "drop")
+
+cohort_yearly_sizes <- cohort_yearly_data %>%
+  filter(Cohort_Index == 0) %>%
+  select(Cohort_Year, Cohort_Size = Users)
+
+cohort_yearly_retention <- cohort_yearly_data %>%
+  left_join(cohort_yearly_sizes, by = "Cohort_Year") %>%
+  mutate(Retention_Rate = Users / Cohort_Size)
+
+# BƯỚC 3: VẼ HEATMAP THEO NĂM
+ggplot(cohort_yearly_retention, aes(x = factor(Cohort_Index), 
+                                    y = as.factor(Cohort_Year))) +
+  geom_tile(aes(fill = Retention_Rate), color = "white", linewidth = 1) +
+  
+  # Text to và rõ ràng hơn vì ít ô hơn
+  geom_text(aes(label = ifelse(Cohort_Index == 0, 
+                               comma(Users), # Tháng 0 hiện số to có dẩy phẩy
+                               percent(Retention_Rate, accuracy = 0.1))),
+            color = "black", size = 4, fontface = "bold") +
+  
+  # Đổi sang tone màu Xanh mướt mát, dễ nhìn hơn Đỏ
+  scale_fill_gradient(low = "#E3F2FD", high = "#004D40", 
+                      labels = percent_format(), name = "Retention Rate") +
+  
+  labs(
+    title = "Yearly Cohort Analysis: Retention Rate Heatmap",
+    subtitle = "Year 0 shows the acquired customers. The following years show retention %.",
+    x = "Years Since First Purchase (Cohort Index)",
+    y = "Cohort Year (Acquisition)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", size = 16),
+    axis.text.y = element_text(face = "bold", size = 12),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    legend.position = "right"
+  )
+```
+
+#### Revenue Heatmap
+
+```{r q4_desc_cohort_revenue_heatmap, echo=FALSE, message=FALSE, warning=FALSE}
+# Revenue heatmap (complement của retention heatmap đã có)
+cohort_yearly_revenue <- df_delivered %>%
+  group_by(customer_id) %>%
+  mutate(
+    Cohort_Year  = year(min(order_date)),
+    Order_Year   = year(order_date),
+    Cohort_Index = Order_Year - Cohort_Year
+  ) %>%
+  ungroup() %>%
+  group_by(Cohort_Year, Cohort_Index) %>%
+  summarise(
+    Avg_Revenue_Per_Customer = mean(revenue, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(cohort_yearly_revenue,
+       aes(x = factor(Cohort_Index),
+           y = as.factor(Cohort_Year),
+           fill = Avg_Revenue_Per_Customer)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = comma(round(Avg_Revenue_Per_Customer))),
+            color = "lightblue", size = 3.5, fontface = "bold") +
+  scale_fill_viridis_c(option = "magma", labels = comma,
+                       name = "Avg Revenue\n/ Customer") +
+  labs(
+    title    = "Yearly Cohort — Avg Revenue per Active Customer",
+    subtitle = "Cohort năm nào có ô màu sáng theo thời gian = khách ngày càng chi nhiều hơn (healthy)",
+    x = "Years Since First Purchase", y = "Cohort Year"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(face = "bold", size = 14))
+```
+
+### 1.2. Average Retention Curve
+
+#### Average Retention Curve (by quarter)
+
+```{r quarterly_retention_curve, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+
+# ==============================================================
+# BƯỚC 1: ASSIGN OBJECTS & TÍNH INDEX THEO QUÝ (QUARTER)
+# ==============================================================
+cohort_qtr_prep <- df_delivered %>%
+  filter(!is.na(order_date)) %>%
+  group_by(customer_id) %>%
+  mutate(
+    # Tìm ngày mua đơn đầu tiên
+    First_Order_Date = min(order_date, na.rm = TRUE),
+    
+    # Quy tròn ngày mua về QUÝ (VD: 2021-02-15 -> 2021-01-01 là Quý 1)
+    Cohort_Qtr = floor_date(First_Order_Date, "quarter"),
+    Order_Qtr = floor_date(order_date, "quarter")
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Tính Cohort Index (Khoảng cách số QUÝ)
+    year_diff = year(Order_Qtr) - year(Cohort_Qtr),
+    qtr_diff = quarter(Order_Qtr) - quarter(Cohort_Qtr),
+    Cohort_Index = year_diff * 4 + qtr_diff # 1 năm có 4 quý
+  )
+
+# ==============================================================
+# BƯỚC 2: TÍNH RETENTION RATE CỦA TỪNG COHORT (QUÝ)
+# ==============================================================
+cohort_qtr_data <- cohort_qtr_prep %>%
+  group_by(Cohort_Qtr, Cohort_Index) %>%
+  summarise(Users = n_distinct(customer_id), .groups = "drop")
+
+# Lấy số User ban đầu (Tại Quý 0)
+cohort_qtr_sizes <- cohort_qtr_data %>%
+  filter(Cohort_Index == 0) %>%
+  select(Cohort_Qtr, Cohort_Size = Users)
+
+# Tính % Giữ chân
+cohort_qtr_retention <- cohort_qtr_data %>%
+  left_join(cohort_qtr_sizes, by = "Cohort_Qtr") %>%
+  mutate(Retention_Rate = Users / Cohort_Size)
+
+# ==============================================================
+# BƯỚC 3: TÍNH TRUNG BÌNH ĐỂ VẼ CURVE
+# ==============================================================
+avg_retention_qtr <- cohort_qtr_retention %>%
+  group_by(Cohort_Index) %>%
+  summarise(
+    Avg_Retention = mean(Retention_Rate, na.rm = TRUE),
+    Cohort_Count = n()
+  ) 
+
+# ==============================================================
+# BƯỚC 4: VẼ BIỂU ĐỒ ĐƯỜNG CONG VÒNG ĐỜI (QUARTERLY)
+# ==============================================================
+ggplot(avg_retention_qtr, aes(x = Cohort_Index, y = Avg_Retention)) +
+  geom_area(fill = "#BBDEFB", alpha = 0.5) +
+  geom_line(color = "#1565C0", linewidth = 1.5) +
+  geom_point(color = "#0D47A1", size = 3) +
+  
+  # Gắn % lên các cột mốc quan trọng: Quý 1, 2, 4 (1 năm), 8 (2 năm)
+  geom_text(data = avg_retention_qtr %>% filter(Cohort_Index %in% c(1, 2, 4, 8, 12)),
+            aes(label = percent(Avg_Retention, accuracy = 0.1)), 
+            vjust = -1.5, fontface = "bold", color = "darkred", size = 4) +
+  
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1.1)) +
+  scale_x_continuous(breaks = seq(0, max(avg_retention_qtr$Cohort_Index), by = 2)) +
+  
+  labs(
+    title = "Average Customer Retention Curve (Quarterly)",
+    subtitle = "Tỷ lệ khách hàng quay lại trung bình theo từng Quý (Hiển thị mốc Quý 1, 2, 4, 8, 12)",
+    x = "Quarters Since First Purchase (1 Quarter = 3 Months)",
+    y = "Average Retention Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+#### Tính delta (độ giảm mỗi quý)
+
+```{r q4_desc_dropoff, echo=FALSE, message=FALSE, warning=FALSE}
+# Tính delta (độ giảm mỗi quý)
+retention_with_delta <- avg_retention_qtr %>%
+  arrange(Cohort_Index) %>%
+  mutate(
+    Delta       = Avg_Retention - lag(Avg_Retention),
+    Is_Worst    = Delta == min(Delta, na.rm = TRUE)
+  )
+
+worst_qtr <- retention_with_delta %>% filter(Is_Worst) %>% pull(Cohort_Index)
+
+ggplot(retention_with_delta, aes(x = Cohort_Index, y = Avg_Retention)) +
+  geom_ribbon(aes(ymin = pmax(Avg_Retention + Delta, 0), ymax = Avg_Retention),
+              fill = "#ffcdd2", alpha = 0.5) +
+  geom_area(fill = "#BBDEFB", alpha = 0.4) +
+  geom_line(color = "#1565C0", linewidth = 1.5) +
+  geom_point(color = "#0D47A1", size = 3) +
+  # Đánh dấu critical drop-off
+  geom_vline(xintercept = worst_qtr, linetype = "dotted",
+             color = "#d32f2f", linewidth = 1.2) +
+  annotate("label",
+           x = worst_qtr + 0.4,
+           y = max(retention_with_delta$Avg_Retention, na.rm = TRUE) * 0.85,
+           label = paste0("Critical Drop\nQuarter ", worst_qtr),
+           fill = "#ffcdd2", color = "#b71c1c", size = 3.5, fontface = "bold") +
+  # Gắn % tại các mốc quan trọng
+  geom_text(data = retention_with_delta %>%
+              filter(Cohort_Index %in% c(1, 2, 4, 8, 12)),
+            aes(label = percent(Avg_Retention, accuracy = 0.1)),
+            vjust = -1.5, fontface = "bold", color = "darkred", size = 3.8) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1.1)) +
+  scale_x_continuous(breaks = seq(0, max(retention_with_delta$Cohort_Index), 2)) +
+  labs(
+    title    = "Average Retention Curve (Quarterly) — Critical Drop-off Detection",
+    subtitle = paste0("Vùng hồng = mức giảm so với quý trước | Quý ", worst_qtr,
+                      " là điểm rụng mạnh nhất → window can thiệp quan trọng nhất"),
+    x = "Quarters Since First Purchase", y = "Avg Retention Rate"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        panel.grid.minor = element_blank())
+```
+
+### 1.3. Time to second purchase
+
+#### Overview
+
+```{r time to sec, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+
+# =====================================================================
+# BƯỚC 1: DÙNG LẠI DATA CHUẨN (ĐÃ LỌC DELIVERED)
+# =====================================================================
+# Lấy thẳng từ inter_order_all đã tạo ở Step 1 (an toàn 100%)
+time_to_second_purchase <- inter_order_all %>%
+  filter(order_rank == 2) %>%  # Step 1 tao xài tên biến order_rank
+  filter(!is.na(gap_days)) 
+
+# =====================================================================
+# BƯỚC 2: TRỰC QUAN HÓA (VISUALIZATION)
+# =====================================================================
+# Tính Median cho toàn bộ tập data
+median_gap_macro <- median(time_to_second_purchase$gap_days, na.rm = TRUE)
+
+# ---------------------------------------------------------------------
+# GRAPH 1 (MACRO-VIEW): Histogram đếm số lượng (Bin = 30 ngày)
+# ---------------------------------------------------------------------
+plot_time_to_2nd_count <- ggplot(time_to_second_purchase, aes(x = gap_days)) +
+  
+  geom_histogram(binwidth = 30, fill = "#69b3a2", color = "white", alpha = 0.9) +
+  stat_bin(binwidth = 30, geom = "text", aes(label = after_stat(count)), 
+           vjust = -0.5, color = "black", size = 3.5, fontface = "bold") +
+  
+  geom_vline(xintercept = median_gap_macro, color = "#e74c3c", linetype = "dashed", linewidth = 1.2) +
+  annotate("label", x = median_gap_macro + 5, y = Inf, vjust = 1.5, hjust = 0,
+           label = paste0("Median = ", median_gap_macro, " ngày"),
+           color = "white", fill = "#e74c3c", fontface = "bold", size = 4) +
+  
+  labs(
+    title = "Time-to-Second-Purchase (Delivered Orders Only)",
+    subtitle = "Phân phối SỐ LƯỢNG khách hàng theo số ngày từ lần mua 1 đến lần mua 2",
+    x = "Gap Days (Số ngày chờ)", y = "Số lượng Khách hàng (Count)"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), labels = scales::comma) +
+  coord_cartesian(xlim = c(0, quantile(time_to_second_purchase$gap_days, 0.95, na.rm = TRUE)))
+
+print(plot_time_to_2nd_count)
+
+# ---------------------------------------------------------------------
+# GRAPH 1.5 (MICRO-VIEW): Histogram đếm số lượng trong 30 ngày đầu (Bin = 1 ngày)
+# ---------------------------------------------------------------------
+time_to_2nd_micro <- time_to_second_purchase %>%
+  filter(gap_days <= 30)
+
+median_gap_micro <- median(time_to_2nd_micro$gap_days, na.rm = TRUE)
+
+plot_time_to_2nd_micro_count <- ggplot(time_to_2nd_micro, aes(x = gap_days)) +
+  
+  geom_histogram(binwidth = 1, fill = "#F39C12", color = "white", alpha = 0.9) + 
+  stat_bin(binwidth = 1, geom = "text", aes(label = after_stat(count)), 
+           vjust = -0.5, color = "black", size = 3.5, fontface = "bold") +
+           
+  geom_vline(xintercept = median_gap_micro, color = "#c0392b", linetype = "dashed", linewidth = 1.2) +
+  annotate("label", x = median_gap_micro + 0.5, y = Inf, vjust = 1.5, hjust = 0,
+           label = paste0("Median = ", median_gap_micro, " ngày"),
+           color = "white", fill = "#c0392b", fontface = "bold", size = 4) +
+  
+  scale_x_continuous(breaks = seq(0, 30, by = 3)) + 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), labels = scales::comma) +
+  
+  labs(
+    title = "Micro-view: Thời điểm vàng trong 30 ngày đầu tiên",
+    subtitle = "Số lượng khách hàng chốt đơn lần 2 trong vòng 1 tháng (Bin = 1 ngày)",
+    x = "Gap Days", y = "Count"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14), panel.grid.minor = element_blank())
+
+print(plot_time_to_2nd_micro_count)
+```
+
+#### Chia về Acquisition Channel
+
+```{r q4_desc_t2sp_channel, echo=FALSE, message=FALSE, warning=FALSE}
+inter_order_delivered <- df_delivered %>%
+  arrange(customer_id, order_date) %>%
+  group_by(customer_id) %>%
+  mutate(
+    order_number = row_number(),
+    Prev_Date    = lag(order_date),
+    Gap_Days     = as.numeric(difftime(order_date, Prev_Date, units = "days"))
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(Gap_Days))
+
+t2sp_channel <- inter_order_delivered %>%
+  filter(order_number == 2, !is.na(Gap_Days)) %>%
+  filter(!is.na(acquisition_channel), acquisition_channel != "o", acquisition_channel != "")
+
+# Tính median per channel để annotate
+t2sp_medians <- t2sp_channel %>%
+  group_by(acquisition_channel) %>%
+  summarise(med = median(Gap_Days), .groups = "drop")
+
+ggplot(t2sp_channel,
+       aes(x = Gap_Days, fill = acquisition_channel)) +
+  geom_histogram(binwidth = 14, color = "white", alpha = 0.85) +
+  geom_vline(data = t2sp_medians,
+             aes(xintercept = med), color = "#d32f2f",
+             linetype = "dashed", linewidth = 1) +
+  geom_text(data = t2sp_medians,
+            aes(x = med + 10, y = Inf,
+                label = paste0("Median:\n", round(med), "d")),
+            vjust = 2, hjust = 0, size = 3, color = "#b71c1c", fontface = "bold") +
+  coord_cartesian(xlim = c(0, quantile(t2sp_channel$Gap_Days, 0.95))) +
+  scale_fill_brewer(palette = "Dark2") +
+  facet_wrap(~acquisition_channel, ncol = 3, scales = "free_y") +
+  labs(
+    title    = "Time-to-Second-Purchase by Acquisition Channel",
+    subtitle = "Đường đỏ = Median. Channel có median thấp hơn = khách quay lại nhanh hơn",
+    x = "Days to 2nd Purchase", y = "Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold"),
+        plot.title = element_text(face = "bold"))
+```
+
+### 1.4. Interorder gap 11 nhóm RFM
+
+```{r q4_desc_gap_ridge, echo=FALSE, message=FALSE, warning=FALSE, fig.height=9}
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(ggridges)  
+library(patchwork) 
+
+# =====================================================================
+# 1. ĐỔI TÊN & GẮN THÊM BIẾN TỪ RFM_RAW CỦA MÀY
+# =====================================================================
+# Lấy inter_order_all join với rfm_raw (bảng chứa 11 nhóm mày đã chạy ở trên)
+plot_data <- inter_order_all %>%
+  left_join(rfm_raw %>% select(customer_id, Segment), by = "customer_id") %>%
+  # Đổi gap_days thành Gap_Days cho khớp logic vẽ chart
+  rename(Gap_Days = gap_days)
+
+seg_order <- c("Champions", "Loyal Customers", "Potential Loyalist",
+               "Needs Attention", "About To Sleep",
+               "Can't Lose Them", "Hibernating",
+               "Promising", "Recent Users", "Price Sensitive", "Lost")
+
+# =====================================================================
+# 2. VẼ RIDGE PLOT (Sử dụng plot_data)
+# =====================================================================
+p_ridge <- plot_data %>%
+  filter(!is.na(Segment), Segment != "Others", !is.na(Gap_Days)) %>%
+  mutate(Segment = factor(Segment, levels = rev(seg_order))) %>%
+  ggplot(aes(x = Gap_Days, y = Segment, fill = Segment)) +
+  geom_density_ridges(alpha = 0.75, scale = 1.1, rel_min_height = 0.01,
+                      bandwidth = 18) +
+  coord_cartesian(xlim = c(0, 800)) +
+  scale_fill_manual(values = c(
+    "Champions"          = "#66CCFF",
+    "Loyal Customers"    = "#808080",
+    "Can't Lose Them"    = "#D9534F",
+    "Potential Loyalist" = "#48C9B0",
+    "Needs Attention"    = "#FAD7A1",
+    "Hibernating"        = "#F0AD4E",
+    "Lost"               = "#C0C0C0",
+    "About To Sleep"     = "#AEE1E1",
+    "Promising"          = "#D2B48C",
+    "Recent Users"       = "#C5E1A5",
+    "Price Sensitive"    = "#B39DDB"
+  )) +
+  labs(
+    title    = "Inter-order Gap Distribution by 11 RFM Segments",
+    subtitle = "Champions: đỉnh nhọn lệch trái (mua nhanh) | Lost/Hibernating: đuôi dài về phải (mua thưa)",
+    x = "Gap Days", y = NULL
+  ) +
+  # SỬA LỖI Ở ĐÂY: Đổi base_size thành font_size
+  theme_ridges(font_size = 11) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+# =====================================================================
+# 3. VẼ BOXPLOT (Sử dụng plot_data)
+# =====================================================================
+p_box <- plot_data %>%
+  filter(!is.na(Customer_Type), !is.na(Gap_Days)) %>%
+  ggplot(aes(x = Customer_Type, y = Gap_Days, fill = Customer_Type)) +
+  geom_boxplot(alpha = 0.75, outlier.alpha = 0.05) +
+  coord_cartesian(ylim = c(0, 800)) +
+  scale_fill_manual(values = c("Core" = "#f57c00",
+                               "Non-Core" = "#90a4ae",
+                               "Whale/B2B" = "#b71c1c")) +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Gap Distribution: Core vs Non-Core vs Whale",
+       x = NULL, y = "Gap Days") +
+  # Thằng theme_minimal này thì vẫn xài base_size bình thường nha
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+# =====================================================================
+# 4. GỘP BIỂU ĐỒ BẰNG PATCHWORK
+# =====================================================================
+p_ridge / p_box + plot_layout(heights = c(3, 1))
+```
+
+### 1.5. Survival Curve
+
+#### Tính churn threshold theo 3 nhóm Whales - Core - Noncore
+
+```{r dynamic_churn_threshold, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+
+# =====================================================================
+# BƯỚC 1: TÍNH CHU KỲ MUA HÀNG CHUNG (OVERALL CYCLE)
+# =====================================================================
+# Dùng lại bảng inter_order_delivered mày đã tạo ở phần trước
+overall_cycle <- inter_order_delivered %>%
+  filter(!is.na(Gap_Days)) %>%
+  summarise(
+    Mean_Gap = mean(Gap_Days, na.rm = TRUE),
+    Median_Gap = median(Gap_Days, na.rm = TRUE)
+  )
+
+print("1. CHU KỲ MUA HÀNG TỔNG THỂ:")
+print(overall_cycle)
+
+# Quyết định ngày Churn: Lấy Median x 3 (Best Practice)
+global_churn_threshold <- overall_cycle$Median_Gap * 3
+
+cat("\n=> Tiêu chuẩn CHURN CHUNG được set là:", global_churn_threshold, 
+    "ngày (Dựa trên công thức: 3 x Median Gap)\n\n")
+
+# =====================================================================
+# BƯỚC 2: NÂNG CẤP VŨ TRỤ - TÍNH CHURN CHO TỪNG NHÓM (DYNAMIC CHURN)
+# =====================================================================
+# Khách VIP mua thường xuyên, họ trễ 30 ngày là đã báo động đỏ.
+# Khách vãng lai chu kỳ dài, trễ 30 ngày là bình thường.
+segment_churn_rules <- inter_order_delivered %>%
+  filter(!is.na(Gap_Days)) %>%
+  # Ghép với bảng rfm_final để lấy nhãn Core/Non-Core
+  left_join(rfm_final %>% select(customer_id, Customer_Type), by = "customer_id") %>%
+  filter(!is.na(Customer_Type)) %>%
+  group_by(Customer_Type) %>%
+  summarise(
+    Khach_Hang_Quay_Lai = n_distinct(customer_id),
+    Median_Gap_Days = median(Gap_Days, na.rm = TRUE),
+    # Set luật Churn riêng cho từng nhóm (Ví dụ: x3 chu kỳ của nhóm đó)
+    Churn_Threshold_Days = Median_Gap_Days * 3,
+    .groups = 'drop'
+  )
+
+print("2. TIÊU CHUẨN CHURN ĐỘNG THEO PHÂN KHÚC (DYNAMIC CHURN RULES):")
+print(segment_churn_rules)
+```
+
+### Tính Survival Curve theo churn threshold
+
+```{r survival curve,echo=FALSE}
+library(survival)
+library(survminer)
+library(dplyr)
+
+# =====================================================================
+# BƯỚC 1: CHUẨN BỊ DATA SINH TỒN VÀ GHÉP NHÃN PHÂN KHÚC
+# =====================================================================
+surv_data_seg <- df_delivered %>%
+  group_by(customer_id) %>%
+  summarise(
+    first_order = min(order_date),
+    last_order = max(order_date),
+    recency_now = as.numeric(difftime(max(df_delivered$order_date), last_order, units="days")),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Time: Số ngày "sống" cùng brand
+    time = as.numeric(difftime(last_order, first_order, units="days")),
+    
+    # Event: Tạm dùng mốc 180 ngày của mày (Hoặc có thể thay bằng biến global_churn_threshold ở code trước)
+    event = ifelse(recency_now > 180, 1, 0),
+    
+    # Fix lỗi time = 0 cho người mua đúng 1 lần
+    time = ifelse(time == 0, 0.1, time)
+  ) %>%
+  # CÚ CHỐT Ở ĐÂY: Ghép với rfm_final để lấy nhãn Core/Non-Core/Whale
+  left_join(rfm_final %>% select(customer_id, Customer_Type), by = "customer_id") %>%
+  filter(!is.na(Customer_Type)) # Lọc bỏ các khách không có nhãn an toàn
+
+# =====================================================================
+# BƯỚC 2: FIT MÔ HÌNH KAPLAN-MEIER THEO TỪNG NHÓM
+# =====================================================================
+# Đổi '~ 1' thành '~ Customer_Type'
+km_fit_seg <- survfit(Surv(time, event) ~ Customer_Type, data = surv_data_seg)
+
+# =====================================================================
+# BƯỚC 3: VẼ ĐƯỜNG CONG SO SÁNH
+# =====================================================================
+ggsurvplot(
+  km_fit_seg, 
+  data = surv_data_seg,
+  conf.int = TRUE,           # Vẽ dải băng (ribbon) thể hiện khoảng tin cậy
+  risk.table = TRUE,         # Bảng đếm số lượng khách còn "sống" bên dưới
+  pval = TRUE,               # In chỉ số P-value để chứng minh khác biệt có ý nghĩa thống kê
+  
+  # Cài màu sắc tương ứng: Core (Cam), Non-Core (Xám), Whales (Đỏ)
+  palette = c("darkorange", "gray60", "firebrick"), 
+  
+  title = "Customer Survival Curve by Segments",
+  subtitle = "Sức sống mãnh liệt của khách hàng Core so với Non-Core",
+  xlab = "Days Since First Purchase",
+  ylab = "Survival Probability",
+  
+  # Làm đẹp phần chú thích (Legend)
+  legend.title = "Phân khúc:",
+  legend.labs = c("Core", "Non-Core", "Whale/B2B"), 
+  
+  # Ép cái bảng risk_table bên dưới lùn bớt để nhường chỗ cho đồ thị
+  risk.table.height = 0.3,
+  
+  ggtheme = theme_minimal()
+)
+```
+
+-   Biểu đồ áp dụng "Churn Động" (Mốc tử hình = 3 lần chu kỳ mua trung vị từng nhóm); với trục X là Tuổi thọ (Tenure tính từ đơn đầu tiên), trục Y là Tỷ lệ tiếp tục gắn bó (Survival Probability).
+-   Cách đọc biểu đồ: Đường cong lao dốc thể hiện lượng lớn khách hàng rời bỏ (Event = 1), đường đi ngang chứng tỏ sự trung thành ổn định; bảng "Number at Risk" giảm dần do khách rụng thực sự hoặc khách chưa đủ tuổi đời để được đếm.
+-   Dữ liệu chứng minh "Cá mập" (Whales) và "Lõi" (Core) là hai mỏ vàng sinh lời vững như bàn thạch qua hàng ngàn ngày. Thay vì đốt tiền Marketing đi tìm khách mới (vốn đa phần sẽ rụng thành Non-core), chiến lược sống còn là phải có chính sách CSKH đặc quyền để giữ chặt Whales và nuôi dưỡng Core!
+
+### 1.6. One-time buyer analysis
+
+#### Overview
+
+```{r q4_desc_one_time, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(patchwork) # Đảm bảo đã gọi patchwork để dùng cú pháp p1 | p2
+
+# =====================================================================
+# BƯỚC 1: TÍNH TOÁN DATA & TỔNG SỐ KHÁCH ONE-TIME
+# =====================================================================
+onetime_summary <- lifecycle_full %>%
+  filter(!is.na(Customer_Type)) %>%
+  mutate(buyer_type = ifelse(n_orders == 1, "One-time", "Repeat"))
+
+# Lấy tổng số lượng khách hàng chỉ mua 1 lần (dùng để in lên tiêu đề)
+total_onetime <- sum(onetime_summary$buyer_type == "One-time", na.rm = TRUE)
+
+# =====================================================================
+# BƯỚC 2: VẼ CHART 1 (AGE GROUP)
+# =====================================================================
+p1 <- onetime_summary %>%
+  count(age_group, buyer_type) %>%
+  group_by(age_group) %>%
+  mutate(pct = n / sum(n)) %>%
+  filter(buyer_type == "One-time") %>%
+  ggplot(aes(x = age_group, y = pct, fill = age_group)) +
+  geom_col(show.legend = FALSE) +
+  
+  # CẬP NHẬT LABEL: In % ở trên, số đếm (n) ở dưới
+  geom_text(aes(label = paste0(percent(pct, accuracy = 0.1), "\n(", comma(n), ")")),
+            vjust = -0.2, size = 3.5, fontface = "bold", lineheight = 0.9, color = "#d35400") +
+            
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, .2))) + # Kéo trục y cao thêm 20% để chữ ko bị lẹm
+  scale_fill_brewer(palette = "Oranges") +
+  labs(title = "% One-time Buyers by Age Group", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# =====================================================================
+# BƯỚC 3: VẼ CHART 2 (ACQUISITION CHANNEL)
+# =====================================================================
+p2 <- onetime_summary %>%
+  filter(!is.na(acquisition_channel), acquisition_channel != "o", acquisition_channel != "") %>%
+  count(acquisition_channel, buyer_type) %>%
+  group_by(acquisition_channel) %>%
+  mutate(pct = n / sum(n)) %>%
+  filter(buyer_type == "One-time") %>%
+  ggplot(aes(x = reorder(acquisition_channel, pct), y = pct,
+             fill = acquisition_channel)) +
+  geom_col(show.legend = FALSE) +
+  
+  # CẬP NHẬT LABEL: In ngang nên ghép chung 1 dòng cho đẹp
+  geom_text(aes(label = paste0(percent(pct, accuracy = 0.1), " (", comma(n), ")")),
+            hjust = -0.1, size = 3.5, fontface = "bold", color = "#2c3e50") +
+            
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0, .25))) + # Kéo trục y ngang thêm 25% 
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "% One-time Buyers by Acquisition Channel", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# =====================================================================
+# BƯỚC 4: GỘP CHART & GẮN TITLE TỔNG
+# =====================================================================
+(p1 | p2) +
+  plot_annotation(
+    title = "One-Time Buyer Analysis",
+    subtitle = paste0("Tổng số khách hàng chỉ mua 1 lần rồi rời đi (Hit-and-Run): ", comma(total_onetime), " users"),
+    theme = theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      plot.subtitle = element_text(size = 13, color = "darkred", face = "italic")
+    )
+  )
+```
+
+#### Time series (quarter)
+
+```{r q4_combined_quarterly_dynamic, echo=FALSE, message=FALSE, warning=FALSE, fig.height=8.5}
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tidyr)
+library(patchwork)
+library(lubridate)
+
+# =====================================================================
+# BƯỚC 1: TÌM ĐƠN 2 VÀ TÍNH LOGIC KHỬ BIAS ĐỘNG
+# =====================================================================
+ANALYSIS_DATE <- max(df_delivered$order_date, na.rm = TRUE)
+
+second_purchases <- df_delivered %>%
+  arrange(customer_id, order_date) %>%
+  group_by(customer_id) %>%
+  slice(2) %>% 
+  select(customer_id, second_order_date = order_date) %>%
+  ungroup()
+
+# Tạo bảng master cho phân tích trend
+quarterly_master <- lifecycle_full %>%
+  filter(!is.na(first_order)) %>%
+  left_join(second_purchases, by = "customer_id") %>%
+  mutate(
+    cohort_qtr = as.Date(floor_date(first_order, "quarter")),
+    days_to_2nd = as.numeric(difftime(second_order_date, first_order, units = "days")),
+    # Luật Dynamic Churn
+    repeat_in_window = ifelse(!is.na(days_to_2nd) & days_to_2nd <= Dynamic_Threshold, 1, 0),
+    tenure_from_now = as.numeric(difftime(ANALYSIS_DATE, first_order, units = "days")),
+    is_mature = ifelse(tenure_from_now >= Dynamic_Threshold, 1, 0)
+  )
+
+# =====================================================================
+# BƯỚC 2: VẼ CHART VOLUME (TẤT CẢ KHÁCH)
+# =====================================================================
+p_vol_qtr <- quarterly_master %>%
+  group_by(cohort_qtr) %>%
+  summarise(
+    `One-time` = sum(n_orders == 1, na.rm = TRUE),
+    `Repeat` = sum(n_orders > 1, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  pivot_longer(-cohort_qtr, names_to = "buyer_type", values_to = "Users") %>%
+  ggplot(aes(x = cohort_qtr, y = Users, color = buyer_type)) +
+  geom_line(linewidth = 1.2) + geom_point(size = 2.5) +
+  scale_color_manual(values = c("One-time" = "#E74C3C", "Repeat" = "#2ECC71")) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "6 months") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "1. Acquisition Volume: One-time vs Repeat Buyers", subtitle = "Lượng khách hàng mới đổ về mỗi Quý", y = "Count", x = NULL, color = "Loại khách:") +
+  theme_minimal() + theme(legend.position = "top", axis.text.x = element_blank(), plot.title = element_text(face = "bold"))
+
+# =====================================================================
+# BƯỚC 3: VẼ CHART QUALITY (CHỈ KHÁCH ĐÃ ĐỦ ĐỘ CHÍN - KHỬ BIAS)
+# =====================================================================
+p_quality_qtr <- quarterly_master %>%
+  filter(is_mature == 1) %>% # CHỈ PHÁN XÉT NHỮNG NGƯỜI ĐÃ ĐỦ THỜI GIAN THỬ THÁCH
+  group_by(cohort_qtr) %>%
+  summarise(
+    Total_Mature = n(),
+    Repeat_OK = sum(repeat_in_window, na.rm = TRUE),
+    Pct_Hit_Run = 1 - (Repeat_OK / Total_Mature),
+    .groups = 'drop'
+  ) %>%
+  filter(Total_Mature > 10) %>% # Loại bỏ các quý quá ít mẫu để tránh nhiễu
+  ggplot(aes(x = cohort_qtr, y = Pct_Hit_Run)) +
+  geom_line(color = "#C0392B", linewidth = 1.2) + geom_point(color = "#922B21", size = 3) +
+  geom_text(aes(label = percent(Pct_Hit_Run, accuracy = 1)), vjust = -1.5, size = 3.2, fontface = "bold", color = "#922B21") +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "6 months") +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.3))) +
+  labs(title = "2. True Hit-and-Run Rate (Unbiased & Dynamic)", subtitle = "Tỷ lệ khách mua 1 lần rồi bỏ đi dựa trên chu kỳ mua hàng riêng biệt của từng nhóm", y = "% Hit-and-Run", x = "Cohort Quarter") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold"), axis.text.x = element_text(angle = 45, hjust = 1))
+
+# =====================================================================
+# BƯỚC 4: GỘP DASHBOARD
+# =====================================================================
+p_vol_qtr / p_quality_qtr + plot_layout(heights = c(1.2, 1)) + 
+  plot_annotation(title = "Quarterly Lifecycle Quality Dashboard", theme = theme(plot.title = element_text(size = 18, face = "bold")))
+```
+
+#### Time series (year)
+
+```{r q4_combined_yearly_dynamic, echo=FALSE, message=FALSE, warning=FALSE, fig.height=8.5}
+# =====================================================================
+# BƯỚC 1: CHUẨN BỊ DATA THEO NĂM
+# =====================================================================
+yearly_master <- quarterly_master %>% # Tận dụng bảng master đã tính ở trên
+  mutate(cohort_yr = as.Date(floor_date(first_order, "year")))
+
+# =====================================================================
+# BƯỚC 2: VẼ CHART VOLUME YEARLY
+# =====================================================================
+p_vol_yr <- yearly_master %>%
+  group_by(cohort_yr) %>%
+  summarise(
+    `One-time` = sum(n_orders == 1, na.rm = TRUE),
+    `Repeat` = sum(n_orders > 1, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  pivot_longer(-cohort_yr, names_to = "buyer_type", values_to = "Users") %>%
+  ggplot(aes(x = cohort_yr, y = Users, color = buyer_type)) +
+  geom_line(linewidth = 1.3) + geom_point(size = 4) +
+  scale_color_manual(values = c("One-time" = "#E74C3C", "Repeat" = "#2ECC71")) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "1. Yearly Acquisition Volume", subtitle = "Quy mô khách hàng mới theo từng năm", y = "Count", x = NULL, color = "Loại khách:") +
+  theme_minimal() + theme(legend.position = "top", axis.text.x = element_blank(), plot.title = element_text(face = "bold"))
+
+# =====================================================================
+# BƯỚC 3: VẼ CHART QUALITY YEARLY (TRUE HIT-AND-RUN)
+# =====================================================================
+p_quality_yr <- yearly_master %>%
+  filter(is_mature == 1) %>%
+  group_by(cohort_yr) %>%
+  summarise(
+    Total_Mature = n(),
+    Repeat_OK = sum(repeat_in_window, na.rm = TRUE),
+    Pct_Hit_Run = 1 - (Repeat_OK / Total_Mature),
+    .groups = 'drop'
+  ) %>%
+  ggplot(aes(x = cohort_yr, y = Pct_Hit_Run)) +
+  geom_line(color = "#2980B9", linewidth = 1.3) + geom_point(color = "#1A5276", size = 4) +
+  geom_text(aes(label = percent(Pct_Hit_Run, accuracy = 0.1)), vjust = -1.8, size = 4.5, fontface = "bold", color = "#1A5276") +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year") +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.3))) +
+  labs(title = "2. Yearly Hit-and-Run Rate (Unbiased)", subtitle = "Sức khỏe giữ chân khách hàng (Retention) thực tế qua các năm", y = "% Hit-and-Run", x = "Cohort Year") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold"))
+
+# =====================================================================
+# BƯỚC 4: GỘP DASHBOARD
+# =====================================================================
+p_vol_yr / p_quality_yr + plot_layout(heights = c(1.2, 1)) + 
+  plot_annotation(title = "Yearly Strategic Quality Dashboard", theme = theme(plot.title = element_text(size = 18, face = "bold")))
+```
+
+Biểu đồ Volume thống kê lượng khách mới theo phân loại One-time vs Repeat nhằm đánh giá quy mô tăng trưởng thô của từng thời kỳ. Biểu đồ Hit-and-Run đo lường chất lượng bằng cách đối chiếu hành vi mua lại với chu kỳ Dynamic Churn Threshold riêng biệt của từng phân khúc. Logic Unbiased được áp dụng để loại bỏ sai số Maturity Bias, chỉ phán xét những khách hàng đã đủ "tuổi đời" để khẳng định trạng thái Churn. Sự kết hợp này giúp bóc tách các giai đoạn tăng trưởng ảo khi số lượng khách tăng vọt nhưng thực chất là tệp khách hàng không trung thành. Đây là thước đo chuẩn xác giúp tối ưu hóa ngân sách Acquisition vào những kênh mang lại giá trị thực tế thay vì chạy theo số lượng ảo. (threshold tính ở phần trên)
+
+## 2. Diagnostic Analytics
+
+### 2.1 Retention Curve theo Cohort Year — Cohort nào "chất" nhất?
+
+```{r q4_diag_cohort_year_curve, echo=FALSE, message=FALSE, warning=FALSE}
+# Tái sử dụng cohort_yearly_retention (đã có)
+cohort_yr_curve <- cohort_yearly_retention %>%
+  filter(Cohort_Index > 0, Cohort_Index <= 8) %>%  # 8 năm
+  group_by(Cohort_Year, Cohort_Index) %>%
+  summarise(avg_retention = mean(Retention_Rate, na.rm = TRUE), .groups = "drop")
+
+ggplot(cohort_yr_curve,
+       aes(x = Cohort_Index, y = avg_retention,
+           color = factor(Cohort_Year), group = Cohort_Year)) +
+  geom_line(linewidth = 1.1, alpha = 0.9) +
+  geom_point(size = 2.5) +
+  scale_color_brewer(palette = "Spectral", name = "Cohort Year") +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  scale_x_continuous(breaks = 1:8) +
+  labs(
+    title    = "Retention Curve by Cohort Year",
+    subtitle = "Đường nằm cao hơn = cohort đó chất lượng hơn (retention bền hơn)",
+    x = "Years Since First Purchase", y = "Avg Retention Rate"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### 2.2. Survival Analysis — Kaplan-Meier phân tầng theo Acquisition Channel
+
+```{r q4_diag_survival_channel, echo=FALSE, message=FALSE, warning=FALSE, fig.height=9}
+# Build survival data với dynamic churn threshold
+surv_channel_data <- lifecycle_full %>%
+  filter(!is.na(tenure_days), !is.na(acquisition_channel),
+         !is.na(Dynamic_Threshold),
+         acquisition_channel != "o") %>%
+  mutate(
+    surv_time  = pmax(tenure_days, 0.1),
+    surv_event = is_dynamic_churned
+  )
+
+km_channel <- survfit(
+  Surv(surv_time, surv_event) ~ acquisition_channel,
+  data = surv_channel_data
+)
+
+ggsurvplot(
+  km_channel,
+  data             = surv_channel_data,
+  conf.int         = FALSE,
+  pval             = TRUE,
+  pval.size        = 4,
+  risk.table       = TRUE,
+  risk.table.height = 0.30,
+  palette          = "Dark2",
+  legend.title     = "Channel",
+  ggtheme          = theme_minimal(base_size = 11),
+  title            = "Survival Curves by Acquisition Channel (Dynamic Churn Threshold)",
+  subtitle         = "p-value từ log-rank test | Mỗi customer dùng ngưỡng churn của segment riêng",
+  xlab             = "Days Since First Purchase",
+  ylab             = "P(Alive)"
+)
+```
+
+```{r q4_diag_logrank, echo=FALSE, message=FALSE, warning=FALSE}
+# Log-rank test chi tiết
+lr_channel <- survdiff(Surv(surv_time, surv_event) ~ acquisition_channel,
+                       data = surv_channel_data)
+cat("=== Log-rank test: Survival by Acquisition Channel ===\n")
+print(lr_channel)
+```
+
+### 2.3 Win-back Analysis — Khách churn đã quay lại chưa?
+
+```{r q4_diag_winback_fixed, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(patchwork)
+
+# =====================================================================
+# BƯỚC 1: XÁC ĐỊNH CÁC BIẾN CỐ WIN-BACK (UNIQUE CUSTOMERS)
+# =====================================================================
+
+# Tìm những khách hàng TỪNG có ít nhất 1 lần Gap > Threshold (Đã quay lại)
+customers_won_back <- inter_order_delivered %>%
+  left_join(lifecycle_full %>% select(customer_id, Dynamic_Threshold), by = "customer_id") %>%
+  filter(Gap_Days > Dynamic_Threshold) %>%
+  distinct(customer_id) %>%
+  mutate(is_won_back = 1)
+
+# Tìm những khách hàng HIỆN TẠI đang Churn (Chưa quay lại)
+# Dựa vào cột is_dynamic_churned mày đã tính ở Step 1
+customers_currently_churned <- lifecycle_full %>%
+  filter(is_dynamic_churned == 1) %>%
+  select(customer_id) %>%
+  mutate(is_currently_churned = 1)
+
+# =====================================================================
+# BƯỚC 2: TÍNH TỶ LỆ WIN-BACK CHUẨN
+# =====================================================================
+# Gộp 2 tập khách hàng lại để tạo thành "Tổng số khách từng chạm ngưỡng Churn"
+churn_pool <- full_join(customers_won_back, customers_currently_churned, by = "customer_id") %>%
+  left_join(lifecycle_full %>% select(customer_id, Customer_Type), by = "customer_id") %>%
+  mutate(
+    is_won_back = coalesce(is_won_back, 0),
+    is_currently_churned = coalesce(is_currently_churned, 0)
+  )
+
+n_total_churned <- nrow(churn_pool)
+n_actual_winback <- sum(churn_pool$is_won_back)
+
+cat(sprintf("Tổng số khách từng vượt ngưỡng chu kỳ (Churn Pool): %d\n", n_total_churned))
+cat(sprintf("Trong đó đã thực sự quay lại mua (Win-back):        %d (%.1f%%)\n\n", 
+            n_actual_winback, 100 * n_actual_winback / n_total_churned))
+
+# =====================================================================
+# BƯỚC 3: TRỰC QUAN HÓA
+# =====================================================================
+
+# Biểu đồ 1: Win-back Gap Distribution (Giữ nguyên logic cũ của mày nhưng lấy từ inter_order_delivered)
+winback_gaps <- inter_order_delivered %>%
+  left_join(lifecycle_full %>% select(customer_id, Dynamic_Threshold), by = "customer_id") %>%
+  filter(Gap_Days > Dynamic_Threshold)
+
+p_wb1 <- ggplot(winback_gaps, aes(x = Gap_Days)) +
+  geom_histogram(binwidth = 90, fill = "#4caf50", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = median(winback_gaps$Gap_Days), linetype = "dashed", color = "#b71c1c") +
+  annotate("label", x = median(winback_gaps$Gap_Days) + 100, y = Inf, vjust = 2, 
+           label = paste0("Median Win-back:\n", round(median(winback_gaps$Gap_Days)), " ngày"),
+           fill = "white", color = "#b71c1c", fontface = "bold") +
+  coord_cartesian(xlim = c(0, 2000)) +
+  labs(title = "Win-back Gap Distribution", subtitle = "Độ trễ trước khi khách quay lại sau khi đã 'Churn'", x = "Days", y = "Events") +
+  theme_minimal()
+
+# Biểu đồ 2: Win-back Rate by Customer Type (ĐÃ SỬA LỖI > 100%)
+p_wb2 <- churn_pool %>%
+  filter(!is.na(Customer_Type)) %>%
+  group_by(Customer_Type) %>%
+  summarise(
+    wb_rate = sum(is_won_back) / n(),
+    n_count = sum(is_won_back),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = Customer_Type, y = wb_rate, fill = Customer_Type)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(percent(wb_rate, accuracy = 0.1), "\n(", n_count, ")")), 
+            vjust = -0.2, size = 3.5, fontface = "bold", lineheight = 0.8) +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, .2))) +
+  scale_fill_manual(values = c("Core" = "#f57c00", "Non-Core" = "#90a4ae", "Whale/B2B" = "#b71c1c")) +
+  labs(title = "Win-back Rate by Segment", subtitle = "Tỷ lệ hồi sinh khách hàng thực tế", x = NULL, y = NULL) +
+  theme_minimal()
+
+p_wb1 | p_wb2
+```
+
+### 2.4 Gap Trend — Ai đang mua thưa dần?
+
+```{r q4_diag_gap_trend, echo=FALSE, message=FALSE, warning=FALSE}
+# gap_trend > 0: khoảng cách giữa các đơn nở ra (nguy hiểm)
+# gap_trend < 0: khoảng cách thu lại (tốt, đang tăng tần suất)
+gap_trend_df <- lifecycle_full %>%
+  filter(!is.na(gap_trend), n_orders >= 3, !is.na(Customer_Type)) %>%
+  mutate(
+    trend_label = case_when(
+      gap_trend >  10 ~ "Drifting Away (>10d/order)",
+      gap_trend >   0 ~ "Slightly Drifting (0–10d)",
+      gap_trend < -10 ~ "Accelerating (<-10d/order)",
+      TRUE            ~ "Stable (−10 to 0)"
+    ),
+    trend_label = factor(trend_label,
+                         levels = c("Drifting Away (>10d/order)",
+                                    "Slightly Drifting (0–10d)",
+                                    "Stable (−10 to 0)",
+                                    "Accelerating (<-10d/order)"))
+  )
+
+ggplot(gap_trend_df,
+       aes(x = Customer_Type, fill = trend_label)) +
+  geom_bar(position = "fill") +
+  geom_text(stat = "count",
+            aes(label = ifelse(after_stat(count) /
+                                 tapply(after_stat(count),
+                                        after_stat(x), sum)[after_stat(x)] > 0.04,
+                               percent(after_stat(count) /
+                                         tapply(after_stat(count),
+                                                after_stat(x), sum)[after_stat(x)],
+                                       accuracy = 1), "")),
+            position = position_fill(vjust = 0.5),
+            size = 3.5, fontface = "bold", color = "white") +
+  scale_fill_manual(values = c(
+    "Drifting Away (>10d/order)"  = "#d32f2f",
+    "Slightly Drifting (0–10d)"   = "#ff9800",
+    "Stable (−10 to 0)"           = "#90a4ae",
+    "Accelerating (<-10d/order)"  = "#2e7d32"
+  )) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title    = "Purchase Frequency Trend by Customer Type",
+    subtitle = "% khách đang mua thưa dần (đỏ) vs tăng tần suất (xanh) | Chỉ tính khách có ≥ 3 đơn",
+    x = NULL, y = NULL, fill = "Trend"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+```
+
+## 3. Predictive Analytics
+
+### 3.1 Cohort Retention Forecast — ARIMA & ETS
+
+```{r q4_pred_retention_forecast, echo=FALSE, message=FALSE, warning=FALSE}
+ret_ts_data <- avg_retention_qtr %>%
+  filter(Cohort_Index >= 1, Cohort_Index <= 35) %>%
+  arrange(Cohort_Index) %>%
+  pull(Avg_Retention)
+
+ret_ts <- ts(ret_ts_data, frequency = 1)
+
+# Fit models
+ets_fit   <- ets(ret_ts)
+arima_fit <- auto.arima(ret_ts)
+
+fc_ets   <- forecast(ets_fit,   h = 4)
+fc_arima <- forecast(arima_fit, h = 4)
+
+# Plot
+# Bước 1: Dùng autoplot cho ETS trước, tắt mảng history mặc định để mình tự vẽ lại cho đẹp
+autoplot(fc_ets, series = "ETS", PI = TRUE) +
+  # Bước 2: Dùng autolayer cho ARIMA (Mean)
+  autolayer(fc_arima$mean, series = "ARIMA", linewidth = 1.1) +
+  # Bước 3: SỬA LỖI Ở ĐÂY - Dùng autolayer cho ret_ts để tự động nối Quarter 16 sang Quarter 17
+  autolayer(ret_ts, series = "History", linewidth = 1.3) +
+  
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  # Bước 4: SỬA LỖI WARNING - Map đúng 3 nhãn đã định nghĩa ở trên vào bảng màu
+  scale_color_manual(values = c("History" = "#1565c0", "ETS" = "#1976d2", "ARIMA" = "#d32f2f")) +
+  
+  labs(
+    title    = "Cohort Retention Forecast — ETS vs ARIMA (next 4 quarters)",
+    subtitle = "Đường xanh đậm = Lịch sử | Dự báo: ETS (xanh nhạt + vùng tin cậy) vs ARIMA (đỏ)",
+    x = "Quarter Index", y = "Avg Retention Rate",
+    color    = "Series"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+```
+
+### 3.2 Churn Prediction — XGBoost với Dynamic Churn Label
+
+```{r q4_pred_churn_prep, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidymodels)
+library(xgboost)
+library(vip)
+library(kableExtra)
+
+# ==========================================
+# BƯỚC 1: PREPARE DATA 
+# ==========================================
+churn_ml_unbiased <- lifecycle_full %>%
+  filter(!is.na(Customer_Type), !is.na(is_dynamic_churned)) %>%
+  left_join(
+    rfm_behavior %>% select(customer_id, discount_dependency, n_unique_products),
+    by = "customer_id"
+  ) %>%
+  mutate(
+    gap_trend           = coalesce(gap_trend, 0),
+    avg_gap             = coalesce(avg_gap, median(avg_gap, na.rm = TRUE)),
+    discount_dependency = coalesce(discount_dependency, 0),
+    n_unique_products   = coalesce(n_unique_products, 1),
+   
+    # is_dynamic_churned = 1 là churned, 0 là active
+    churned             = factor(is_dynamic_churned, 
+                                 levels = c(1, 0), 
+                                 labels = c("churned", "active"))
+  ) %>%
+  select(
+    churned,
+    n_orders, total_revenue, avg_gap, gap_trend, 
+    tenure_days, n_unique_products, discount_dependency, 
+    age_group, acquisition_channel, Customer_Type
+  ) %>%
+  drop_na()
+
+# ==========================================
+# BUOC 2: TRAIN/TEST SPLIT & RECIPE
+# ==========================================
+set.seed(123)
+# Chia data theo ty le 80/20, giu nguyen ti le nhan (strata)
+churn_split <- initial_split(churn_ml_unbiased, prop = 0.8, strata = churned)
+train_data  <- training(churn_split)
+test_data   <- testing(churn_split)
+
+# Tao Recipe de tien xu ly du lieu
+churn_recipe <- recipe(churned ~ ., data = train_data) %>%
+  # Chuyen bien category sang Dummy variables (One-hot encoding)
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  # Loai bo cac bien co bien thien bang 0
+  step_zv(all_predictors()) %>%
+  # Chuan hoa cac bien so ve cung mot thang do
+  step_normalize(all_numeric_predictors())
+
+# ==========================================
+# BUOC 3: MODEL SPEC & WORKFLOW
+# ==========================================
+# Cau hinh model XGBoost voi cac tham so kiem soat Overfitting
+xgb_spec <- boost_tree(
+  trees = 500, 
+  tree_depth = 4,       # Do sau vua phai de model khong bi hoc vet
+  learn_rate = 0.02,    # Toc do hoc cham de tim ra quy luat ben vung
+  loss_reduction = 0.1
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_workflow <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(xgb_spec)
+
+# Tien hanh huan luyen model
+xgb_fit <- xgb_workflow %>% fit(data = train_data)
+
+# ==========================================
+# BUOC 4: EVALUATION (DANH GIA THUC TE)
+# ==========================================
+# Du bao tren tap Test de kiem tra do chinh xac thuc te
+results <- test_data %>%
+  select(churned) %>%
+  bind_cols(predict(xgb_fit, test_data, type = "prob")) %>%
+  bind_cols(predict(xgb_fit, test_data))
+
+# Tinh toan cac chi so model
+model_metrics <- metrics(results, truth = churned, estimate = .pred_class)
+auc_val <- roc_auc(results, truth = churned, .pred_churned)
+
+# Truc quan hoa duong cong ROC
+p_roc_new <- results %>%
+  roc_curve(truth = churned, .pred_churned) %>%
+  autoplot() +
+  labs(title = "ROC Curve (Unbiased Model)", 
+       subtitle = paste0("AUC = ", round(auc_val$.estimate, 4), " (Khong bi leakage boi Recency)")) +
+  theme_minimal()
+
+# Truc quan hoa cac bien quan trong nhat (Feature Importance)
+p_vip_new <- xgb_fit %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 10, geom = "col", aesthetics = list(fill = "#E67E22")) +
+  labs(title = "Feature Importance (Behavioral)",
+       subtitle = "Top cac hanh vi thuc su dan den rui ro Churn") +
+  theme_minimal()
+
+# Hien thi ket qua biểu đồ ghép
+print(p_roc_new | p_vip_new)
+
+# In bang chi so ra console
+cat("\n--- BANG CHI SO MODEL ---\n")
+print(model_metrics)
+```
+
+## 4. Prescriptive Analytics
+
+### 4.1 Intervention Timing — Ngưỡng nào cần trigger campaign?
+
+```{r q4_presc_timing, echo=FALSE, message=FALSE, warning=FALSE}
+# Tính median gap + trigger threshold cho 11 segment
+inter_order_labelled <- inter_order_delivered %>%
+  filter(!is.na(Gap_Days)) %>%
+  left_join(
+    lifecycle_full %>% select(customer_id, Customer_Type,
+                              is_dynamic_churned),
+    by = "customer_id"
+  ) %>%
+  left_join(
+    rfm_raw %>% select(customer_id, Segment),
+    by = "customer_id"
+  )
+
+intervention_thresholds <- inter_order_labelled %>%
+  filter(!is.na(Segment), Segment != "Others", !is.na(Gap_Days)) %>%
+  group_by(Segment) %>%
+  summarise(
+    n_customers      = n_distinct(customer_id),
+    median_gap       = round(median(Gap_Days, na.rm = TRUE)),
+    p75_gap          = round(quantile(Gap_Days, 0.75, na.rm = TRUE)),
+    # Trigger = 1.5× median gap của chính segment đó
+    trigger_day      = ceiling(median_gap * 1.5),
+    urgent_day       = ceiling(median_gap * 2.0),
+    .groups = "drop"
+  ) %>%
+  arrange(trigger_day)
+
+kable(intervention_thresholds,
+      caption = "Intervention Timing Thresholds by RFM Segment",
+      col.names = c("Segment", "N Customers", "Median Gap (d)",
+                    "P75 Gap (d)", "Trigger Day (1.5×)", "Urgent Day (2×)"),
+      format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(5, bold = TRUE, color = "white", background = "#f57c00") %>%
+  column_spec(6, bold = TRUE, color = "white", background = "#d32f2f")
+```
+
+```{r q4_presc_atrisk_now, echo=FALSE, message=FALSE, warning=FALSE}
+# Khách đang ở VÙNG NGUY HIỂM ngay hôm nay
+# (days_since_last nằm giữa trigger_day và urgent_day)
+at_risk_today <- lifecycle_full %>%
+  filter(!is.na(Segment), Segment != "Others", is_dynamic_churned == 0) %>%
+  left_join(intervention_thresholds %>%
+              select(Segment, trigger_day, urgent_day),
+            by = "Segment") %>%
+  filter(Recency >= trigger_day,
+         Recency <  urgent_day) %>%
+  count(Segment, acquisition_channel, name = "n_at_risk") %>%
+  arrange(desc(n_at_risk))
+
+cat("Tổng khách đang ở vùng nguy hiểm:", sum(at_risk_today$n_at_risk), "\n\n")
+
+at_risk_today %>%
+  head(15) %>%
+  kable(caption = "Top 15 Segment × Channel cần trigger ngay hôm nay") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+## 4.2 Win-back Priority List
+
+```{r q4_presc_winback_priority_refined, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(scales)
+library(kableExtra)
+
+seg_wb_rate <- lifecycle_full %>%
+  filter(!is.na(Segment)) %>%
+  left_join(
+    customers_won_back %>%
+      distinct(customer_id) %>%
+      mutate(did_winback = 1L),
+    by = "customer_id"
+  ) %>%
+  mutate(did_winback = replace_na(did_winback, 0L)) %>%
+  group_by(Segment) %>%
+  summarise(winback_rate = mean(did_winback), .groups = "drop")
+
+# Priority score = Monetary × winback_rate (proxy CLV × P(return))
+winback_priority <- lifecycle_full %>%
+  filter(is_dynamic_churned == 1, !is.na(Segment), Segment != "Others") %>%
+  left_join(churn_scores %>% select(customer_id, churn_prob),
+            by = "customer_id") %>%
+  left_join(seg_wb_rate, by = "Segment") %>%
+  mutate(
+    winback_rate   = replace_na(winback_rate, 0),
+    priority_score = total_revenue * winback_rate   # CLV proxy × P(return)
+  ) %>%
+  filter(priority_score > 0) %>%
+  arrange(desc(priority_score)) %>%
+  select(customer_id, Segment, Customer_Type, acquisition_channel,
+         Recency, total_revenue, winback_rate, priority_score)
+
+cat("Churned customers trong priority list:", nrow(winback_priority), "\n\n")
+
+winback_priority %>%
+  head(20) %>%
+  kable(digits = c(0,0,0,0,0,0,3,0),
+        format.args = list(big.mark = ","),
+        caption = "Top 20 Win-back Priority List (Sorted by Priority Score)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(8, bold = TRUE, color = "white", background = "#2e7d32")
+```
+
+## 4.3 Prescriptive Playbook — Action Table
+
+```{r q4_presc_playbook, echo=FALSE, message=FALSE, warning=FALSE}
+# 1. Tính toán mức chiết khấu trung bình và số lượng khách theo từng Segment
+# Dựa trên dữ liệu từ rfm_behavior và lifecycle_full đã assign
+seg_behavior <- rfm_behavior %>%
+  left_join(lifecycle_full %>% select(customer_id, Segment) %>% distinct(), by = "customer_id") %>%
+  filter(!is.na(Segment), Segment != "Others") %>%
+  group_by(Segment) %>%
+  summarise(
+    avg_discount_pct = mean(discount_dependency, na.rm = TRUE),
+    median_monetary  = median(total_revenue, na.rm = TRUE),
+    n_customers      = n(),
+    .groups = "drop"
+  )
+
+# 2. Lấy ngưỡng can thiệp (Trigger) từ luật Dynamic Churn đã tính
+seg_thresholds <- lifecycle_full %>%
+  filter(!is.na(Segment), Segment != "Others") %>%
+  group_by(Segment) %>%
+  summarise(
+    trigger_day = floor(mean(Dynamic_Threshold, na.rm = TRUE)),
+    urgent_day  = trigger_day + 30, # Mốc khẩn cấp: sau 1 tháng kể từ ngày can thiệp
+    .groups = "drop"
+  )
+
+# 3. Gộp tất cả lại thành Playbook (seg_wb_rate lấy từ Step 4.2 trước đó)
+playbook <- seg_thresholds %>%
+  left_join(seg_wb_rate, by = "Segment") %>%
+  left_join(seg_behavior, by = "Segment") %>%
+  mutate(
+    # ROI proxy = (Giá trị kỳ vọng thu hồi) / (Chi phí giảm giá dự kiến)
+    roi_proxy = ifelse(avg_discount_pct > 0, 
+                       (median_monetary * winback_rate) / (median_monetary * avg_discount_pct), 
+                       NA_real_),
+    
+    recommended_action = case_when(
+      Segment %in% c("Champions", "Loyal Customers") ~ 
+        "Loyalty reward / early access — KHÔNG mass discount",
+      Segment == "Potential Loyalist" ~ 
+        paste0("Personalized next-product rec. Trigger tại ngày ", trigger_day),
+      Segment %in% c("Needs Attention", "About To Sleep") ~ 
+        paste0("Email trigger tại ngày ", trigger_day, " (urgency copy)"),
+      Segment %in% c("Can't Lose Them", "Hibernating") ~ 
+        paste0("Win-back SMS + voucher tại ngày ", trigger_day),
+      Segment == "Lost" ~ 
+        "Win-back chỉ nếu ROI > 1.2; ngược lại drop sang email tự động",
+      Segment %in% c("Promising", "Recent Users", "Price Sensitive") ~ 
+        "Bundle offer / freeship để tăng frequency",
+      TRUE ~ "Monitor"
+    ),
+    
+    channel_rec = case_when(
+      Segment %in% c("Champions", "Loyal Customers") ~ "Direct / Email Private",
+      Segment %in% c("Potential Loyalist", "Recent Users") ~ "Social Media Ads",
+      Segment %in% c("Needs Attention", "About To Sleep") ~ "Email Automation",
+      Segment %in% c("Can't Lose Them", "Hibernating") ~ "SMS / Tele-marketing",
+      Segment == "Price Sensitive" ~ "In-app Notification",
+      TRUE ~ "Email / Notification"
+    )
+  ) %>%
+  arrange(desc(median_monetary)) %>%
+  select(Segment, n_customers, trigger_day, urgent_day, 
+         winback_rate, median_monetary, roi_proxy, 
+         recommended_action, channel_rec)
+
+# 4. Hiển thị bảng đẹp mắt bằng kableExtra
+# Lưu ý: Cột ROI Proxy sẽ được đổ màu dựa trên giá trị để dễ nhận diện
+kable(playbook, 
+      caption = "Prescriptive Playbook — Data-Driven Action by Segment",
+      col.names = c("Segment", "N", "Trigger", "Urgent", 
+                    "Winback Rate", "Median LTV", "ROI Proxy", 
+                    "Recommended Action", "Channel"),
+      digits = c(0, 0, 0, 0, 3, 0, 1, 0, 0),
+      format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = TRUE, font_size = 11) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(7, bold = TRUE, color = "white", 
+              background = spec_color(playbook$roi_proxy, end = 0.7, option = "viridis", na_color = "#BBBBBB")) %>%
+  column_spec(8, bold = TRUE) %>%
+  column_spec(9, italic = TRUE, color = "#1565c0")
+```
+
+# Q5: Acquisition Channel nào mang lại LTV tốt nhất?
+
+## 1. Descriptive Analytics — Tổng quan Channel Performance
+
+### 1.1. BẢNG TỔNG QUAN CHANNEL — Revenue, Volume, AOV, Discount Dependency
+
+```{r q5_channel_descriptive, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(patchwork)
+
+
+channel_overview <- df_delivered %>%
+  group_by(acquisition_channel) %>%
+  summarise(
+    Total_Customers   = n_distinct(customer_id),
+    Total_Revenue     = sum(revenue, na.rm = TRUE),
+    Total_Orders      = n_distinct(order_id),
+    AOV               = Total_Revenue / Total_Orders,
+    Revenue_Per_Cust  = Total_Revenue / Total_Customers,
+    Avg_Discount_Dep  = sum(discount_amount, na.rm = TRUE) /
+                        sum(quantity * unit_price, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Total_Revenue))
+
+kable(channel_overview,
+      digits  = c(0, 0, 0, 0, 1, 1, 3),
+      caption = "Performance Overview by Acquisition Channel",
+      col.names = c("Channel", "Customers", "Revenue", "Orders",
+                    "AOV", "Rev/Customer", "Discount Dep."),
+      format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(6, bold = TRUE, color = "white",
+              background = spec_color(channel_overview$Revenue_Per_Cust,
+                                      end = 0.7, option = "viridis"))
+```
+
+### 1.2. BUBBLE CHART — Volume vs. Efficiency (Phân vùng chiến lược 4 góc)
+
+```{r q5_channel_bubble, echo=FALSE, message=FALSE, warning=FALSE}
+
+ggplot(channel_overview,
+       aes(x = Total_Customers, y = Revenue_Per_Cust,
+           size = Total_Revenue, label = acquisition_channel)) +
+  geom_point(aes(color = Avg_Discount_Dep), alpha = 0.7) +
+  geom_text(vjust = -1.2, size = 3.5, fontface = "bold") +
+  scale_size_continuous(range = c(5, 20), labels = comma) +
+  scale_color_gradient(low = "steelblue", high = "firebrick",
+                       name = "Discount\nDependency") +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  geom_hline(yintercept = median(channel_overview$Revenue_Per_Cust),
+             linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = median(channel_overview$Total_Customers),
+             linetype = "dashed", color = "gray50") +
+  annotate("text", x = Inf, y = Inf, label = "High Value\nLarge Base",
+           hjust = 1.1, vjust = 1.5, size = 3, color = "darkgreen", fontface = "italic") +
+  annotate("text", x = -Inf, y = Inf, label = "High Value\nSmall Base",
+           hjust = -0.1, vjust = 1.5, size = 3, color = "darkorange", fontface = "italic") +
+  annotate("text", x = Inf, y = -Inf, label = "Low Value\nLarge Base",
+           hjust = 1.1, vjust = -0.5, size = 3, color = "firebrick", fontface = "italic") +
+  annotate("text", x = -Inf, y = -Inf, label = "Low Value\nSmall Base",
+           hjust = -0.1, vjust = -0.5, size = 3, color = "gray40", fontface = "italic") +
+  labs(
+    title    = "Channel Strategy Matrix: Volume vs. Revenue per Customer",
+    subtitle = "Bubble size = Total Revenue | Color = Discount Dependency",
+    x        = "Total Customers (Volume)",
+    y        = "Revenue per Customer (Efficiency)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 2. Diagnostic Analytics — Chất lượng Customer từng Channel
+
+### 2.1. PHÂN BỔ CUSTOMER TYPE (11 nhóm RFM) THEO CHANNEL
+
+```{r q5_channel_quality, echo=FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(forcats) # Thư viện cực mạnh để xử lý sắp xếp (reorder)
+
+# --- BƯỚC 1: LÀM SẠCH DATA GỐC ---
+df_plot_base <- lifecycle_full %>%
+  filter(!is.na(acquisition_channel), 
+         acquisition_channel != "", 
+         acquisition_channel != "o",
+         !is.na(Segment), Segment != "Others",
+         !is.na(Customer_Type))
+
+# --- BƯỚC 2: TẠO BẢNG SUMMARY CHO SEGMENT (BAR 1) ---
+dist_segment <- df_plot_base %>%
+  count(Segment, acquisition_channel) %>%
+  group_by(Segment) %>%
+  mutate(pct = n / sum(n), total = sum(n)) %>%
+  ungroup() %>%
+  mutate(Segment = fct_reorder(Segment, total),
+         acquisition_channel = fct_reorder(acquisition_channel, pct))
+
+# --- BƯỚC 3: TẠO BẢNG SUMMARY CHO CUSTOMER TYPE (BAR 2) ---
+# Quan trọng: Tính lại pct dựa trên Customer_Type để ko bị cộng dồn sai
+dist_type <- df_plot_base %>%
+  count(Customer_Type, acquisition_channel) %>%
+  group_by(Customer_Type) %>%
+  mutate(pct = n / sum(n), total = sum(n)) %>%
+  ungroup() %>%
+  mutate(Customer_Type = fct_reorder(Customer_Type, total),
+         acquisition_channel = fct_reorder(acquisition_channel, pct))
+
+# --- BƯỚC 4: VẼ BIỂU ĐỒ ---
+
+# Bar 1: Theo Segment
+ggplot(dist_segment, aes(x = Segment, y = pct, fill = acquisition_channel)) +
+  geom_bar(stat = "identity", position = position_stack(reverse = TRUE)) +
+  geom_text(aes(label = ifelse(pct > 0.05, percent(pct, accuracy = 1), "")),
+            position = position_stack(vjust = 0.5, reverse = TRUE), size = 3, color = "white", fontface = "bold") +
+  scale_fill_brewer(palette = "Set2", name = "Channel") +
+  scale_y_continuous(labels = percent_format()) +
+  coord_flip() +
+  labs(title = "Mix by Segment", x = "RFM Segment", y = "% Contribution") +
+  theme_minimal() + theme(legend.position = "none")
+
+
+```
+
+```{r q5_channel_rfm_heatmap, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 2: HEATMAP — Phân phối 11 RFM Segment theo Channel
+# ==========================================================================
+channel_segment_matrix <- rfm_raw %>%
+  left_join(df_delivered %>% distinct(customer_id, acquisition_channel),
+            by = "customer_id") %>%
+  filter(!is.na(acquisition_channel),
+         acquisition_channel != "",
+         acquisition_channel != "o",
+         !is.na(Segment), Segment != "Others") %>%
+  count(acquisition_channel, Segment) %>%
+  group_by(acquisition_channel) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup()
+
+ggplot(channel_segment_matrix,
+       aes(x = acquisition_channel,
+           y = reorder(Segment, pct),
+           fill = pct)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = percent(pct, accuracy = 0.1)), size = 3) +
+  scale_fill_gradient(low = "#f7fbff", high = "#08306b",
+                      labels = percent_format(),
+                      name = "% Customers") +
+  labs(title    = "RFM Segment Distribution by Acquisition Channel",
+       subtitle = "Heatmap cho thấy channel nào tập trung khách Champions/Loyal?",
+       x = "Channel", y = "RFM Segment") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r q5_channel_payment_device, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 3: HÀNH VI THANH TOÁN & THIẾT BỊ — Diagnostic bổ sung
+# ==========================================================================
+channel_behavior <- df_delivered %>%
+  filter(!is.na(acquisition_channel), acquisition_channel != "o") %>%
+  group_by(acquisition_channel) %>%
+  summarise(
+    pct_mobile       = mean(device_type == "mobile", na.rm = TRUE),
+    pct_promo_order  = mean(is_promo == 1, na.rm = TRUE),
+    avg_quantity     = mean(quantity, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_mobile <- ggplot(channel_behavior,
+       aes(x = reorder(acquisition_channel, pct_mobile),
+           y = pct_mobile, fill = acquisition_channel)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_continuous(labels = percent_format()) +
+  coord_flip() +
+  labs(title = "Mobile Usage Rate", x = NULL, y = "% Orders on Mobile") +
+  theme_minimal()
+
+p_promo <- ggplot(channel_behavior,
+       aes(x = reorder(acquisition_channel, pct_promo_order),
+           y = pct_promo_order, fill = acquisition_channel)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_continuous(labels = percent_format()) +
+  coord_flip() +
+  labs(title = "Promo Usage Rate", x = NULL, y = "% Orders with Promo") +
+  theme_minimal()
+
+(p_mobile | p_promo) +
+  plot_annotation(
+    title    = "Behavioral Fingerprint per Channel",
+    subtitle = "Diagnostic: Khách từ kênh nào phụ thuộc promo và ưa mobile?"
+  )
+```
+
+## 3. Predictive Analytics — LTV & Conversion Modelling
+
+```{r q5_channel_predictive_convert, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 1: TIME TO FIRST ORDER — Kênh nào chuyển đổi nhanh nhất?
+# ==========================================================================
+time_to_convert <- df_delivered %>%
+  group_by(customer_id) %>%
+  slice_min(order_date, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(days_to_convert = as.numeric(
+    difftime(order_date, signup_date, units = "days"))) %>%
+  filter(days_to_convert >= 0,
+         !is.na(acquisition_channel),
+         acquisition_channel != "o")
+
+# Summary thống kê rõ ràng
+convert_summary <- time_to_convert %>%
+  group_by(acquisition_channel) %>%
+  summarise(
+    median_days = median(days_to_convert, na.rm = TRUE),
+    p25_days    = quantile(days_to_convert, 0.25, na.rm = TRUE),
+    p75_days    = quantile(days_to_convert, 0.75, na.rm = TRUE),
+    n           = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(median_days)
+
+ggplot(time_to_convert,
+       aes(x = reorder(acquisition_channel, days_to_convert, FUN = median),
+           y = days_to_convert, fill = acquisition_channel)) +
+  geom_violin(alpha = 0.4, trim = TRUE) +
+  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.7) +
+  stat_summary(fun = median, geom = "text",
+               aes(label = round(..y.., 0)),
+               hjust = -0.3, size = 3.5, fontface = "bold") +
+  coord_cartesian(ylim = c(0, 60)) +
+  coord_flip() +
+  labs(title    = "Time to First Purchase by Channel (Violin + Box)",
+       subtitle = "Giới hạn 60 ngày | Số ghi là Median Days to Convert",
+       x = "Channel", y = "Days to First Order") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r q5_channel_ltv_proxy, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 2: PROXY LTV — Historical LTV annualised + Cohort LTV Projection
+# ==========================================================================
+
+# A. Proxy Annual LTV 
+channel_ltv <- rfm_behavior %>%
+  left_join(df %>% distinct(customer_id, acquisition_channel), by = "customer_id") %>%
+  filter(tenure_days > 30,
+         !is.na(acquisition_channel),
+         acquisition_channel != "o") %>%
+  mutate(Estimated_Annual_Value = (total_revenue / tenure_days) * 365) %>%
+  group_by(acquisition_channel) %>%
+  summarise(
+    N                = n(),
+    Median_Annual_LTV = median(Estimated_Annual_Value, na.rm = TRUE),
+    Avg_Annual_LTV    = mean(Estimated_Annual_Value, na.rm = TRUE),
+    P90_Annual_LTV    = quantile(Estimated_Annual_Value, 0.90, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Median_Annual_LTV))
+
+kable(channel_ltv,
+      digits  = c(0, 0, 0, 0, 0),
+      caption = "Estimated Annual LTV by Channel (Historic Proxy)",
+      col.names = c("Channel", "N", "Median Annual LTV",
+                    "Avg Annual LTV", "P90 Annual LTV"),
+      format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(3, bold = TRUE, color = "white",
+              background = spec_color(channel_ltv$Median_Annual_LTV,
+                                      end = 0.7, option = "plasma"))
+```
+
+```{r q5_channel_ltv_model, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 3: RANDOM FOREST — Dự đoán LTV từ channel + demographics + behavior
+# ==========================================================================
+library(tidymodels)
+library(vip)
+library(ranger)  # Fast Random Forest engine
+
+# Chuẩn bị dataset: 1 dòng = 1 khách hàng
+ltv_model_data <- rfm_behavior %>%
+  left_join(df %>% distinct(customer_id, acquisition_channel, gender,
+                             age_group, signup_date), by = "customer_id") %>%
+  left_join(lifecycle_full %>% select(customer_id, Segment,
+                                      is_dynamic_churned), by = "customer_id") %>%
+  filter(!is.na(acquisition_channel), acquisition_channel != "o",
+         !is.na(total_revenue), total_revenue > 0,
+         !is.na(age_group), !is.na(gender)) %>%
+  mutate(
+    log_ltv = log1p(total_revenue),       # Biến mục tiêu: log-transform để ổn định
+    tenure_months = tenure_days / 30
+  ) %>%
+  select(log_ltv, acquisition_channel, gender, age_group,
+         Frequency, tenure_months, discount_dependency,
+         n_unique_products, AOV, is_dynamic_churned) %>%
+  drop_na()
+
+# Train/Test split
+set.seed(2024)
+ltv_split <- initial_split(ltv_model_data, prop = 0.8)
+ltv_train  <- training(ltv_split)
+ltv_test   <- testing(ltv_split)
+
+# Recipe
+ltv_recipe <- recipe(log_ltv ~ ., data = ltv_train) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# Random Forest spec (ranger = nhanh hơn randomForest)
+rf_spec <- rand_forest(trees = 300, mtry = 4, min_n = 10) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+rf_workflow <- workflow() %>%
+  add_recipe(ltv_recipe) %>%
+  add_model(rf_spec)
+
+rf_fit <- rf_workflow %>% fit(data = ltv_train)
+
+# Đánh giá mô hình
+rf_preds <- ltv_test %>%
+  bind_cols(predict(rf_fit, ltv_test) %>% rename(pred_log_ltv = .pred)) %>%
+  mutate(pred_ltv  = expm1(pred_log_ltv),
+         actual_ltv = expm1(log_ltv))
+
+rf_rmse <- rmse(rf_preds, truth = log_ltv, estimate = pred_log_ltv)
+rf_r2   <- rsq(rf_preds, truth = log_ltv, estimate = pred_log_ltv)
+
+cat(sprintf("RF Model — RMSE (log scale): %.4f | R²: %.4f\n",
+            rf_rmse$.estimate, rf_r2$.estimate))
+
+# Biểu đồ Feature Importance
+p_vip_ltv <- rf_fit %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 12, geom = "col",
+      aesthetics = list(fill = "#2980B9", alpha = 0.85)) +
+  labs(title    = "Feature Importance — LTV Prediction Model",
+       subtitle = "Channel có ảnh hưởng bao nhiêu so với behavior signals?") +
+  theme_minimal()
+
+print(p_vip_ltv)
+
+# Predicted LTV by Channel — Dùng model để "normalize" hành vi
+predicted_by_channel <- ltv_test %>%
+  bind_cols(predict(rf_fit, ltv_test) %>% rename(pred_log_ltv = .pred)) %>%
+  mutate(pred_ltv = expm1(pred_log_ltv)) %>%
+  group_by(acquisition_channel) %>%
+  summarise(Model_Predicted_Median_LTV = median(pred_ltv, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(Model_Predicted_Median_LTV))
+
+kable(predicted_by_channel,
+      digits = 0,
+      format.args = list(big.mark = ","),
+      caption = "Model-Predicted Median LTV by Channel (RF Regression)",
+      col.names = c("Channel", "Predicted Median LTV")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r q5_channel_cohort_retention, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 4: COHORT RETENTION RATE THEO CHANNEL (tháng đầu tiên mua hàng)
+# ==========================================================================
+first_order_date <- df_delivered %>%
+  group_by(customer_id) %>%
+  summarise(first_order_month = floor_date(min(order_date), "month"),
+            .groups = "drop")
+
+cohort_channel <- df_delivered %>%
+  group_by(customer_id, order_month = floor_date(order_date, "month")) %>%
+  summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop") %>%
+  left_join(first_order_date, by = "customer_id") %>%
+  left_join(df %>% distinct(customer_id, acquisition_channel), by = "customer_id") %>%
+  filter(!is.na(acquisition_channel), acquisition_channel != "o") %>%
+  mutate(cohort_month = as.numeric(
+    difftime(order_month, first_order_month, units = "weeks")) %/% 4)
+
+# Retention rate: % khách quay lại tháng 1, 2, 3
+channel_retention <- cohort_channel %>%
+  filter(cohort_month <= 6) %>%
+  group_by(acquisition_channel, cohort_month) %>%
+  summarise(n_active = n_distinct(customer_id), .groups = "drop") %>%
+  group_by(acquisition_channel) %>%
+  mutate(retention_rate = n_active / first(n_active)) %>%
+  ungroup()
+
+ggplot(channel_retention,
+       aes(x = cohort_month, y = retention_rate,
+           color = acquisition_channel, group = acquisition_channel)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_x_continuous(breaks = 0:6) +
+  labs(title    = "Cohort Retention Rate by Acquisition Channel (Month 0–6)",
+       subtitle = "Kênh nào giữ chân khách lâu nhất sau tháng đầu tiên?",
+       x = "Month Since First Purchase", y = "Retention Rate",
+       color = "Channel") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+## 4. Prescriptive Analytics — Tối ưu Marketing Mix
+
+```{r q5_channel_cac_estimate, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 1: LTV:CAC PROXY — Tính ROI proxy từng kênh
+# ==========================================================================
+
+# CAC proxy dựa trên discount + promo chi phí gián tiếp
+channel_cost_proxy <- df_delivered %>%
+  filter(!is.na(acquisition_channel), acquisition_channel != "o") %>%
+  group_by(acquisition_channel) %>%
+  summarise(
+    n_customers        = n_distinct(customer_id),
+    total_discount_cost = sum(discount_amount, na.rm = TRUE),
+    avg_discount_per_cust = total_discount_cost / n_distinct(customer_id),
+    .groups = "drop"
+  )
+
+# Gộp LTV + CAC proxy
+channel_roi <- channel_ltv %>%
+  left_join(channel_cost_proxy, by = "acquisition_channel") %>%
+  mutate(
+    # LTV:CAC ratio (cao hơn = kênh tốt hơn về ROI)
+    LTV_CAC_ratio = Median_Annual_LTV / pmax(avg_discount_per_cust, 1),
+    # Channel tier
+    Channel_Tier = case_when(
+      LTV_CAC_ratio >= quantile(LTV_CAC_ratio, 0.67, na.rm = TRUE) ~ "Tier 1 — Scale Up",
+      LTV_CAC_ratio >= quantile(LTV_CAC_ratio, 0.33, na.rm = TRUE) ~ "Tier 2 — Optimise",
+      TRUE                                                          ~ "Tier 3 — Reduce / Test"
+    )
+  ) %>%
+  arrange(desc(LTV_CAC_ratio)) %>%
+  select(acquisition_channel, N, Median_Annual_LTV,
+         avg_discount_per_cust, LTV_CAC_ratio, Channel_Tier)
+
+kable(channel_roi,
+      digits  = c(0, 0, 0, 0, 1, 0),
+      caption = "Channel ROI Matrix — LTV:CAC Proxy",
+      col.names = c("Channel", "N Customers", "Median Annual LTV",
+                    "Avg Discount/Customer", "LTV:CAC Proxy", "Tier"),
+      format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(5, bold = TRUE, color = "white",
+              background = spec_color(channel_roi$LTV_CAC_ratio,
+                                      end = 0.7, option = "viridis")) %>%
+  column_spec(6, bold = TRUE,
+              color = ifelse(channel_roi$Channel_Tier == "Tier 1 — Scale Up",
+                             "darkgreen", "black"))
+```
+
+```{r q5_channel_budget_allocation, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 2: BUDGET ALLOCATION RECOMMENDATION (Linear Optimisation Proxy)
+# ==========================================================================
+
+# Giả sử tổng budget = 100 đơn vị, phân bổ theo LTV:CAC weighted
+total_budget_units <- 100
+
+channel_budget <- channel_roi %>%
+  mutate(
+    # Weight = LTV:CAC ratio (cao hơn → được nhiều budget hơn)
+    weight = LTV_CAC_ratio / sum(LTV_CAC_ratio, na.rm = TRUE),
+    # Budget allocation
+    budget_allocation = round(weight * total_budget_units, 1),
+    # Dự kiến revenue nếu scale thêm 1 đơn vị budget
+    marginal_return = Median_Annual_LTV * weight
+  ) %>%
+  select(acquisition_channel, Channel_Tier, LTV_CAC_ratio,
+         weight, budget_allocation, marginal_return)
+
+p_budget <- ggplot(channel_budget,
+       aes(x = reorder(acquisition_channel, budget_allocation),
+           y = budget_allocation,
+           fill = Channel_Tier)) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = paste0(budget_allocation, "%")),
+            hjust = -0.1, fontface = "bold", size = 4) +
+  scale_fill_manual(values = c("Tier 1 — Scale Up"      = "#27AE60",
+                               "Tier 2 — Optimise"      = "#F39C12",
+                               "Tier 3 — Reduce / Test" = "#C0392B")) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, max(channel_budget$budget_allocation) * 1.2)) +
+  labs(title    = "Recommended Marketing Budget Allocation by Channel",
+       subtitle = "Dựa trên LTV:CAC Proxy | Tổng = 100 đơn vị",
+       x = NULL, y = "Budget Allocation (%)") +
+  theme_minimal(base_size = 12)
+
+print(p_budget)
+```
+
+```{r q5_channel_retargeting, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 3: RETARGETING LIST — High-Value Customers by Channel để ưu tiên
+# ==========================================================================
+
+# Top customers theo channel, lọc Core + Whale + chưa churn
+retarget_priority <- lifecycle_full %>%
+  filter(is_dynamic_churned == 0,
+         Customer_Type %in% c("Core", "Whale/B2B")) %>%
+  left_join(rfm_behavior %>% select(customer_id, AOV), by = "customer_id") %>%
+  group_by(acquisition_channel) %>%
+  summarise(
+    n_high_value_active = n(),
+    total_revenue_at_risk = sum(total_revenue, na.rm = TRUE),
+    median_ltv = median(total_revenue, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(acquisition_channel), acquisition_channel != "o") %>%
+  arrange(desc(total_revenue_at_risk))
+
+kable(retarget_priority,
+      digits  = c(0, 0, 0, 0),
+      caption = "Retargeting Priority: Active High-Value Customers by Channel",
+      col.names = c("Channel", "Active HV Customers",
+                    "Revenue at Stake", "Median LTV"),
+      format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r q5_channel_playbook, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 4: CHANNEL STRATEGY PLAYBOOK — Action Table tổng hợp
+# ==========================================================================
+library(tibble)
+
+channel_playbook <- tribble(
+  ~Channel,          ~Tier,                   ~Insight,                                             ~Action,                                                  ~KPI,
+  "organic_search",  "Evaluate",              "Largest base nhưng cần verify quality vs paid",       "SEO content targeting high-intent keywords, A/B test landing pages", "Core% & Retention M3",
+  "social_media",    "Scale / Optimise",      "High mobile usage, good for brand awareness",         "Lookalike audiences từ Core customers, retarget lapsed", "CAC & Conv. Rate",
+  "paid_search",     "Optimise ROI",          "High intent nhưng discount-sensitive",                "Smart bidding, exclude low-LTV segments, bid up on Whale profiles", "LTV:CAC, ROAS",
+  "email_campaign",  "Scale — Low Cost",      "Low cost channel, nurture existing base",             "Segment-triggered flows (Q4 thresholds), win-back sequences", "Open rate, Repeat purchase%",
+  "referral",        "Scale if LTV high",     "Referred users tend to have better retention",        "Referral programme incentive optimisation, track referrer LTV", "Referral LTV vs organic",
+  "direct",          "Protect — High LTV",    "Likely loyal / brand-aware customers",                "VIP programme, early access, loyalty rewards — NO mass promo", "Churn rate, NPS"
+)
+
+kable(channel_playbook,
+      caption = "Q5 Channel Strategy Playbook — Prescriptive Action Table",
+      col.names = c("Channel", "Tier", "Key Insight", "Recommended Action", "Success KPI")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE, font_size = 11) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(4, italic = TRUE, color = "#1565c0") %>%
+  row_spec(which(channel_playbook$Tier %in% c("Scale / Optimise", "Scale — Low Cost",
+                                               "Scale if LTV high", "Protect — High LTV")),
+           background = "#f0fff0")
+```
+
+------------------------------------------------------------------------
+
+# OVERALL: Predictive & Prescriptive Tổng Thể Dataset
+
+## OV-1. Customer Revenue Forecasting — ARIMA + Prophet
+
+```{r overall_revenue_forecast, echo=FALSE, message=FALSE, warning=FALSE}
+library(forecast)
+library(lubridate)
+
+# ==========================================================================
+# BƯỚC 1: AGGREGATE MONTHLY REVENUE TIME SERIES
+# ==========================================================================
+monthly_revenue <- df_delivered %>%
+  mutate(month = floor_date(order_date, "month")) %>%
+  group_by(month) %>%
+  summarise(revenue = sum(revenue, na.rm = TRUE), .groups = "drop") %>%
+  arrange(month)
+
+# Loại bỏ tháng cuối nếu chưa đủ dữ liệu (< 15 ngày)
+last_month_days <- df_delivered %>%
+  mutate(month = floor_date(order_date, "month")) %>%
+  filter(month == max(month)) %>%
+  summarise(n_days = n_distinct(as.Date(order_date))) %>%
+  pull(n_days)
+
+if (last_month_days < 15) {
+  monthly_revenue <- monthly_revenue %>% slice(-n())
+}
+
+rev_ts <- ts(monthly_revenue$revenue,
+             start = c(year(min(monthly_revenue$month)),
+                       month(min(monthly_revenue$month))),
+             frequency = 12)
+
+# ==========================================================================
+# BƯỚC 2: AUTO ARIMA
+# ==========================================================================
+arima_fit     <- auto.arima(rev_ts, seasonal = TRUE, stepwise = FALSE)
+arima_forecast <- forecast(arima_fit, h = 6)
+
+autoplot(arima_forecast) +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "Revenue Forecast — ARIMA (Next 6 Months)",
+       subtitle  = sprintf("Model: %s | AICc = %.1f",
+                           arima_fit$arma %>% paste(collapse=","),
+                           arima_fit$aicc),
+       x = "Month", y = "Forecasted Revenue") +
+  theme_minimal(base_size = 12)
+```
+
+```{r overall_stl_decomp, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 3: STL DECOMPOSITION — Tách trend, seasonality, residual
+# ==========================================================================
+if (length(rev_ts) >= 24) {  # STL cần ít nhất 2 chu kỳ
+  stl_fit <- stl(rev_ts, s.window = "periodic")
+  autoplot(stl_fit) +
+    labs(title = "Revenue Decomposition (STL)",
+         subtitle = "Trend / Seasonality / Residual — Cơ cấu tăng trưởng") +
+    theme_minimal()
+} else {
+  cat("Cần ít nhất 24 tháng để chạy STL decomposition.\n")
+  cat(sprintf("Dataset hiện có %d tháng.\n", length(rev_ts)))
+}
+```
+
+## OV-2. Customer Segmentation — Unsupervised Clustering (K-Means + PCA)
+
+```{r overall_kmeans_pca, echo=FALSE, message=FALSE, warning=FALSE}
+library(factoextra)
+library(cluster)
+
+# ==========================================================================
+# BƯỚC 1: CHUẨN BỊ FEATURE MATRIX (RFM + Behavior)
+# ==========================================================================
+cluster_features <- rfm_behavior %>%
+  left_join(lifecycle_full %>% select(customer_id, is_dynamic_churned,
+                                       tenure_days), by = "customer_id") %>%
+  filter(!is.na(total_revenue), total_revenue > 0) %>%
+  select(customer_id, Recency, Frequency, total_revenue,
+         AOV, discount_dependency,
+         n_unique_products, is_dynamic_churned) %>%
+  drop_na() %>%
+  mutate(across(-customer_id, ~ log1p(abs(.x))))  # Log-transform để giảm skew
+
+cluster_matrix <- cluster_features %>%
+  select(-customer_id) %>%
+  scale()   # Chuẩn hóa Z-score
+
+# ==========================================================================
+# BƯỚC 2: ELBOW METHOD — Chọn số K tối ưu
+# ==========================================================================
+set.seed(42)
+wss_vals <- sapply(2:8, function(k) {
+  kmeans(cluster_matrix, centers = k, nstart = 10, iter.max = 50)$tot.withinss
+})
+
+elbow_df <- data.frame(k = 2:8, wss = wss_vals)
+p_elbow <- ggplot(elbow_df, aes(x = k, y = wss)) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  geom_point(size = 3, color = "steelblue") +
+  labs(title = "Elbow Method — Optimal K for Customer Clustering",
+       x = "Number of Clusters (K)", y = "Within-Cluster Sum of Squares") +
+  theme_minimal()
+print(p_elbow)
+
+# ==========================================================================
+# BƯỚC 3: K-MEANS với K tối ưu (thường là 4-5)
+# ==========================================================================
+optimal_k <- 4
+km_fit <- kmeans(cluster_matrix, centers = optimal_k,
+                 nstart = 25, iter.max = 100)
+
+cluster_features$Cluster <- factor(km_fit$cluster)
+
+# ==========================================================================
+# BƯỚC 4: PCA VISUALISATION
+# ==========================================================================
+pca_res <- prcomp(cluster_matrix, center = FALSE, scale. = FALSE)
+pca_df  <- as.data.frame(pca_res$x[, 1:2]) %>%
+  mutate(Cluster = cluster_features$Cluster)
+
+pca_var_exp <- summary(pca_res)$importance[2, 1:2] * 100
+
+ggplot(pca_df %>% sample_n(min(5000, nrow(pca_df))),
+       aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(alpha = 0.3, size = 1) +
+  stat_ellipse(linewidth = 1.2, level = 0.80) +
+  labs(
+    title    = "Customer Clusters — PCA Projection",
+    subtitle = sprintf("PC1 = %.1f%% var | PC2 = %.1f%% var | K = %d clusters",
+                       pca_var_exp[1], pca_var_exp[2], optimal_k),
+    x = paste0("PC1 (", round(pca_var_exp[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_var_exp[2], 1), "%)")
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r overall_cluster_profile, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BƯỚC 5: CLUSTER PROFILING — Ý nghĩa kinh doanh từng cụm
+# ==========================================================================
+cluster_profile <- cluster_features %>%
+  group_by(Cluster) %>%
+  summarise(
+    N             = n(),
+    Median_Recency    = round(median(expm1(Recency), na.rm = TRUE)),
+    Median_Frequency  = round(median(expm1(Frequency), na.rm = TRUE)),
+    Median_Revenue    = round(median(expm1(total_revenue), na.rm = TRUE)),
+    Median_AOV        = round(median(expm1(AOV), na.rm = TRUE)),
+    Churn_Rate        = round(mean(expm1(is_dynamic_churned), na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Persona = case_when(
+      Median_Revenue == max(Median_Revenue) & Median_Frequency == max(Median_Frequency) ~
+        "👑 VIP / Champions",
+      Churn_Rate == max(Churn_Rate) ~
+        "💤 High-Risk / Lapsed",
+      Median_Frequency > median(Median_Frequency) & Median_Revenue > median(Median_Revenue) ~
+        "⭐ Loyal & Growing",
+      TRUE ~
+        "🌱 New / Occasional"
+    )
+  )
+
+kable(cluster_profile,
+      digits  = c(0, 0, 0, 0, 0, 0, 3, 0),
+      caption = "Cluster Profiles — Business Personas",
+      col.names = c("Cluster", "N", "Median Recency (days)",
+                    "Median Freq", "Median Revenue", "Median AOV",
+                    "Churn Rate", "Persona"),
+      format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(8, bold = TRUE)
+```
+
+## OV-3. Overall Churn & LTV Scorecard
+
+```{r overall_business_scorecard, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# BẢNG TỔNG HỢP KPI TOÀN DATASET
+# ==========================================================================
+snapshot_date <- max(df_delivered$order_date, na.rm = TRUE)
+
+overall_kpi <- tibble(
+  KPI = c(
+    "Total Customers (delivered orders)",
+    "Active Customers (not churned)",
+    "Overall Churn Rate",
+    "Overall Retention Rate (M1→M2)",
+    "Median Customer LTV (all time)",
+    "Avg Annual LTV (annualised)",
+    "Avg Inter-Order Gap (days)",
+    "Core Customer Share",
+    "Top Channel by LTV"
+  ),
+  Value = c(
+    comma(n_distinct(df_delivered$customer_id)),
+    comma(sum(lifecycle_full$is_dynamic_churned == 0, na.rm = TRUE)),
+    percent(mean(lifecycle_full$is_dynamic_churned, na.rm = TRUE), accuracy = 0.1),
+    {
+      m0 <- df_delivered %>%
+        mutate(m = floor_date(order_date, "month")) %>%
+        group_by(customer_id) %>%
+        summarise(first_m = min(m), .groups = "drop")
+      m1 <- df_delivered %>%
+        mutate(m = floor_date(order_date, "month")) %>%
+        left_join(m0, by = "customer_id") %>%
+        filter(m == first_m + months(1)) %>%
+        pull(customer_id) %>% n_distinct()
+      m0_n <- n_distinct(m0$customer_id)
+      percent(m1 / m0_n, accuracy = 0.1)
+    },
+    comma(round(median(rfm_behavior$total_revenue, na.rm = TRUE))),
+    comma(round(mean((rfm_behavior$total_revenue /
+                       pmax(rfm_behavior$tenure_days, 1)) * 365,
+                     na.rm = TRUE))),
+    round(median(inter_order_delivered$Gap_Days, na.rm = TRUE)),
+    percent(mean(rfm_final$Customer_Type == "Core", na.rm = TRUE), accuracy = 0.1),
+    channel_ltv %>% slice_max(Median_Annual_LTV, n = 1) %>% pull(acquisition_channel)
+  )
+)
+
+kable(overall_kpi,
+      caption = "Business Health Scorecard — Overall Dataset",
+      col.names = c("KPI", "Value")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, color = "#1a5276")
+```
+
+## OV-4. Prescriptive — Strategic Roadmap
+
+```{r overall_prescriptive_roadmap, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# MA TRẬN HÀNH ĐỘNG CHIẾN LƯỢC TỔNG THỂ
+# ==========================================================================
+library(tibble)
+
+strategic_roadmap <- tribble(
+  ~Priority, ~Time_Horizon, ~Initiative,                           ~Target_Segment,             ~Channel,               ~Expected_Impact,
+  "P0",      "0–30 days",   "Win-back: Top 10% churned by LTV",   "High-Value Churned",        "SMS + Direct Email",   "Revenue recovery từ cohort giá trị cao",
+  "P0",      "0–30 days",   "Trigger campaign at Dynamic Threshold","Needs Attention / At-risk", "Email Automation",     "Giảm churn rate thêm 5–8%",
+  "P1",      "30–90 days",  "Loyalty VIP tier cho Champions",      "Champions + Loyal",         "In-app + Direct",      "Tăng Frequency + referral effect",
+  "P1",      "30–90 days",  "Budget reallocation: Scale Tier 1",   "All new acquisitions",      "Paid Search / Email",  "Tối ưu CAC, tăng LTV:CAC ratio",
+  "P1",      "30–90 days",  "Personalised cross-sell (RF model)",  "Potential Loyalist",        "Social Retargeting",   "Tăng AOV 10–15% nhóm mid-tier",
+  "P2",      "90–180 days", "Cohort A/B test: Channel vs. LTV",   "New acquisitions only",     "Paid vs. Organic",     "Xác nhận causal effect của channel",
+  "P2",      "90–180 days", "Subscription / Bundle offer test",   "Core + High-Freq",          "Email + In-app",       "Tăng predictable MRR",
+  "P3",      "180+ days",   "Predictive LTV at acquisition",      "All new users",             "Paid Media DSP",       "Bid optimisation dựa trên predicted LTV",
+  "P3",      "180+ days",   "Dynamic pricing by segment",         "Price Sensitive vs. Core",  "All channels",         "Tối ưu margin, giảm over-discounting"
+)
+
+kable(strategic_roadmap,
+      caption = "Overall Prescriptive Strategic Roadmap",
+      col.names = c("Priority", "Time Horizon", "Initiative",
+                    "Target Segment", "Channel", "Expected Impact")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE, font_size = 11) %>%
+  column_spec(1, bold = TRUE,
+              color = ifelse(strategic_roadmap$Priority == "P0", "white", "black"),
+              background = ifelse(strategic_roadmap$Priority == "P0", "#C0392B",
+                           ifelse(strategic_roadmap$Priority == "P1", "#F9E79F",
+                           ifelse(strategic_roadmap$Priority == "P2", "#D5F5E3",
+                                  "white")))) %>%
+  column_spec(6, italic = TRUE, color = "#1a5276")
+```
+
+```{r overall_prescriptive_summary, echo=FALSE, message=FALSE, warning=FALSE}
+# ==========================================================================
+# EXECUTIVE SUMMARY — 5 INSIGHT CHÍNH
+# ==========================================================================
+cat("
+╔══════════════════════════════════════════════════════════════════╗
+║         EXECUTIVE SUMMARY — EDA PRESCRIPTIVE INSIGHTS           ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║  1. CORE CUSTOMERS (~RFM tier) chiếm thiểu số nhưng đóng góp   ║
+║     phần lớn revenue → Ưu tiên bảo vệ và nurture nhóm này.     ║
+║                                                                  ║
+║  2. CUSTOMER LIFECYCLE: Inter-order gap rất khác nhau theo      ║
+║     RFM segment. Trigger campaign tại 1.5× median gap của       ║
+║     từng segment thay vì dùng ngưỡng cố định.                   ║
+║                                                                  ║
+║  3. ACQUISITION CHANNEL: Không phải kênh lớn nhất = tốt nhất.  ║
+║     Cần đo LTV:CAC per channel. Scale budget vào Tier 1,        ║
+║     tối ưu Tier 2, và test lại Tier 3.                         ║
+║                                                                  ║
+║  4. CHURN PREDICTION (XGBoost): Chỉ win-back khách có           ║
+║     0.4 < P(churn) < 0.85 — đây là 'vùng cứu được'.           ║
+║     Nhóm P(churn) > 0.85 → drop sang email passive.            ║
+║                                                                  ║
+║  5. REVENUE FORECAST: Dùng ARIMA để set monthly targets và      ║
+║     alert khi actual < lower bound forecast → trigger           ║
+║     investigation ngay trong tháng.                             ║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+")
+```
+
+```{r churn fixed}
+# =====================================================================
+# THỐNG NHẤT LOGIC CHURN THEO DYNAMIC THRESHOLD (126 - 423 - 759)
+# =====================================================================
+
+library(dplyr)
+library(scales)
+
+# 1. Tạo bảng tra cứu ngưỡng (Mapping thresholds từ segment_churn_rules của mày)
+threshold_lookup <- tibble(
+  Customer_Type = c("Whale/B2B", "Core", "Non-Core"),
+  Dynamic_Limit = c(126, 423, 759) # Lấy đúng số từ bảng mày gửi
+)
+
+# 2. Xác định những người từng Win-back thành công (Từng có 1 lần Gap > Threshold)
+# Lưu ý: inter_order_delivered chứa lịch sử tất cả các Gap trong quá khứ
+successful_winbacks <- inter_order_delivered %>%
+  left_join(rfm_final %>% select(customer_id, Customer_Type), by = "customer_id") %>%
+  left_join(threshold_lookup, by = "Customer_Type") %>%
+  # Nếu Gap_Days trong quá khứ từng có lần nào lớn hơn ngưỡng của nhóm đó -> Đã từng Churn
+  filter(Gap_Days > Dynamic_Limit) %>%
+  distinct(customer_id) %>%
+  mutate(has_ever_returned = TRUE)
+
+# 3. Gộp vào bảng Master để phân loại trạng thái cuối cùng
+master_churn_report <- lifecycle_full %>%
+  select(customer_id, Customer_Type, Recency) %>%
+  left_join(threshold_lookup, by = "Customer_Type") %>%
+  left_join(successful_winbacks, by = "customer_id") %>%
+  mutate(
+    has_ever_returned = coalesce(has_ever_returned, FALSE),
+    # A. TRẠNG THÁI HIỆN TẠI
+    is_currently_active = ifelse(Recency <= Dynamic_Limit, 1, 0),
+    
+    # B. TỔNG SỐ KHÁCH TỪNG RỜI BỎ (EVER CHURNED)
+    # Bao gồm: người đang rụng + người từng rụng nhưng đã quay lại (win-back)
+    is_ever_churned = ifelse(Recency > Dynamic_Limit | has_ever_returned == TRUE, 1, 0)
+  )
+
+# 4. TÍNH TOÁN CÁC CHỈ SỐ CHO REPORT
+total_n <- nrow(master_churn_report)
+n_active <- sum(master_churn_report$is_currently_active)
+n_ever_churned <- sum(master_churn_report$is_ever_churned)
+n_winback_total <- sum(master_churn_report$has_ever_returned)
+
+# Tính sâu hơn cho nhóm Winback (Những người đã được cứu)
+winback_group <- master_churn_report %>% filter(has_ever_returned == TRUE)
+n_wb_active <- sum(winback_group$is_currently_active)
+n_wb_rechurn <- nrow(winback_group) - n_wb_active
+
+# 5. IN KẾT QUẢ ĐỂ ĐIỀN VÀO REPORT
+cat("--- CON SỐ CHUẨN ĐỂ ĐIỀN VÀO REPORT ---\n")
+cat(sprintf("Tổng khách hàng: %s\n", comma(total_n)))
+cat(sprintf("Đang hoạt động (Active): %s (%f%%)\n", comma(n_active), 100*n_active/total_n))
+cat(sprintf("Từng rời bỏ (Ever Churned): %s (%f%%)\n", comma(n_ever_churned), 100*n_ever_churned/total_n))
+cat(sprintf("Cứu vãn thành công (Win-back): %s (%f%% của nhóm từng Churn)\n", 
+            comma(n_winback_total), 100*n_winback_total/n_ever_churned))
+cat(sprintf("Trong số quay lại: %f%% vẫn Active, %f%% đã tái rời bỏ (Re-churn)\n", 
+            100*n_wb_active/n_winback_total, 100*n_wb_rechurn/n_winback_total))
+
+library(tidyverse)
+library(scales)
+
+# Lấy các chỉ số trung vị từ bảng master feature của mày
+# Lưu ý: Dùng customer_features (bảng đã aggregate theo customer_id)
+metrics <- customer_features %>%
+  summarise(
+    med_monetary = median(Monetary, na.rm = TRUE),
+    med_recency  = median(Recency, na.rm = TRUE),
+    med_aov      = median(AOV, na.rm = TRUE)
+  )
+
+# In kết quả ra để copy vào báo cáo
+cat(glue::glue("
+  - Doanh thu trung vị: {dollar(metrics$med_monetary)}
+  - Thời gian Recency trung vị: {round(metrics$med_recency)} ngày
+  - AOV trung vị: {dollar(metrics$med_aov)}
+"))
+
+
+```

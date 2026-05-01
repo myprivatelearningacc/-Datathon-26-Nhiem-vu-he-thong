@@ -1,0 +1,1463 @@
+---
+title: "Trajectory 2 — Churn Accelerates: Prediction Model"
+subtitle: "Predictive & Prescriptive Analytics Pipeline"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, error = TRUE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(data.table)
+library(scales)
+library(lubridate)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+library(rfm)
+
+# ML libraries
+library(tidymodels)
+library(xgboost)
+library(ranger)
+library(vip)
+library(probably)     # calibration
+library(bonsai)       # lightgbm backend (optional)
+
+# Survival analysis
+library(survival)
+library(survminer)
+
+# Time series forecasting
+library(fable)
+library(tsibble)
+library(feasts)
+library(fabletools)
+
+
+library(ragg)
+
+# Xuất tất cả plot đang mở trong session
+```
+
+---
+
+# PHẦN 0 — Data Wrangling & Tạo Feature Base
+
+```{r data-wrangling}
+# ── 0A. ĐỌC DỮ LIỆU ──────────────────────────────────────────────────────────
+df_raw <- fread("df_2_FIXED.csv")
+df3    <- fread("df_3.csv")          # product info
+
+df_raw <- df_raw %>%
+  mutate(
+    order_date  = mdy(order_date),
+    signup_date = mdy(signup_date),
+    order_source = ifelse(order_source == "paid_se", "paid_search", order_source)
+  )
+
+# ── 0B. CHỈ LẤY "DELIVERED" ĐỂ TÍNH HÀNH VI THỰC ──────────────────────────
+df_delivered <- df_raw %>% filter(order_status == "delivered")
+
+ANALYSIS_DATE <- max(df_raw$order_date)   # ngày cuối của dataset
+
+# ── 0C. REVENUE PER ORDER LINE ─────────────────────────────────────────────
+# df_2_FIXED không có price/cogs → join từ df_3
+product_ref <- df3 %>%
+  select(product_id, price, cogs) %>%
+  distinct(product_id, .keep_all = TRUE)
+
+df_delivered <- df_delivered %>%
+  left_join(product_ref, by = "product_id") %>%
+  mutate(
+    gross_revenue = price * quantity,
+    net_revenue   = gross_revenue - discount_amount,
+    gross_margin  = (price - cogs) * quantity,
+    net_margin    = gross_margin - discount_amount,
+    has_promo     = ifelse(is.na(promo_id) | promo_id == "", 0, 1)
+  )
+
+# ── 0D. CUSTOMER-LEVEL FEATURE TABLE ─────────────────────────────────────────
+customer_features <- df_delivered %>%
+  group_by(customer_id) %>%
+  summarise(
+    # Core RFM
+    first_order       = min(order_date),
+    last_order        = max(order_date),
+    Recency           = as.numeric(ANALYSIS_DATE - max(order_date)),
+    Frequency         = n_distinct(order_id),
+    Monetary          = sum(net_revenue, na.rm = TRUE),
+    AOV               = Monetary / Frequency,
+
+    # Behaviour signals
+    tenure_days       = as.numeric(max(order_date) - min(order_date)),
+    n_unique_products = n_distinct(product_id),
+    promo_dependency  = mean(has_promo, na.rm = TRUE),
+    return_rate       = mean(order_status == "returned", na.rm = TRUE),  # joined from raw
+    avg_quantity      = mean(quantity, na.rm = TRUE),
+
+    # Purchase velocity (avg inter-order gap — proxy for purchase cadence)
+    avg_gap_days      = ifelse(
+      n_distinct(order_id) > 1,
+      as.numeric(difftime(max(order_date), min(order_date), units = "days")) / (n_distinct(order_id) - 1),
+      NA_real_
+    ),
+
+    # Acquisition info (first order context)
+    acquisition_channel = first(acquisition_channel),
+    age_group           = first(age_group),
+    gender              = first(gender),
+    cohort_year         = year(min(order_date)),
+    cohort_month        = floor_date(min(order_date), "month"),
+
+    .groups = "drop"
+  )
+
+# ── 0E. OUTLIER FLAG (WHALES / B2B) ─────────────────────────────────────────
+p99_F <- quantile(customer_features$Frequency, 0.99, na.rm = TRUE)
+p99_M <- quantile(customer_features$Monetary,  0.99, na.rm = TRUE)
+
+customer_features <- customer_features %>%
+  mutate(
+    is_whale      = ifelse(Frequency > p99_F | Monetary > p99_M, 1, 0),
+    Customer_Type = case_when(
+      is_whale == 1 ~ "Whale/B2B",
+      TRUE ~ "Normal"
+    )
+  )
+
+cat("Total customers (delivered):", nrow(customer_features), "\n")
+cat("Whales / B2B:", sum(customer_features$is_whale), "\n")
+
+```
+
+```{r rfm-segments}
+# ── 0F. RFM SEGMENT — tái tạo logic từ EDA Q2 ────────────────────────────────
+# EDA Q2 dùng ntile(4) trên Normal customers (non-whale) → R/F/M score 1–4
+# Sau đó map sang 11 segment labels dựa trên R_Score và FM_Score
+
+normal_customers <- customer_features %>%
+  filter(is_whale == 0) %>%
+  mutate(
+    R_Score = ntile(desc(Recency),  5),   # cao hơn = mua gần hơn = tốt hơn
+    F_Score = ntile(Frequency,      5),
+    M_Score = ntile(Monetary,       5),
+    FM_Score = round((F_Score + M_Score) / 2),
+
+    # 11 RFM Segments — đúng logic từ rfm_raw trong EDA Q2
+    RFM_Segment = case_when(
+      R_Score == 5 & FM_Score >= 4 ~ "Champions",
+      R_Score %in% c(3, 4) & FM_Score >= 4 ~ "Loyal Customers",
+      R_Score %in% c(1, 2) & FM_Score > 4 ~ "Can't Lose Them",
+      (R_Score == 4 & FM_Score ==3) | (R_Score == 5 & FM_Score == 3) ~ "Potential Loyalist",
+      R_Score == 3 & FM_Score == 3 ~ "Needs Attention",
+      R_Score %in% c(1, 2) & FM_Score %in% c(3,4) ~ "Hibernating",
+      R_Score %in% c(1, 2) & FM_Score %in% c(1,2) ~ "Lost",
+      R_Score == 3 & FM_Score %in% c(1, 2) ~ "About To Sleep",
+      R_Score == 4 & FM_Score == 1 ~ "Promising",
+      R_Score %in% c(4, 5) & FM_Score == 2 ~ "Recent Users",
+      R_Score == 5 & FM_Score == 1 ~ "Price Sensitive",
+      TRUE ~ "Others" 
+    ),
+
+    # Numeric RFM score (dùng làm feature liên tục trong XGBoost)
+    RFM_Score = R_Score + F_Score + M_Score
+  )
+
+whales_rfm <- customer_features %>%
+  filter(is_whale == 1) %>%
+  mutate(R_Score = NA_real_, F_Score = NA_real_, M_Score = NA_real_,
+         FM_Score = NA_real_, RFM_Segment = "Whale/B2B", RFM_Score = NA_real_)
+
+# Gộp lại thành customer_features hoàn chỉnh có RFM Segment
+customer_features <- bind_rows(normal_customers, whales_rfm)
+
+# Segment distribution
+seg_dist <- customer_features %>%
+  filter(is_whale == 0) %>%
+  count(RFM_Segment, sort = TRUE) %>%
+  mutate(pct = n / sum(n))
+
+cat("=== RFM Segment Distribution ===\n")
+print(seg_dist)
+
+customer_features <- customer_features %>%
+  mutate(
+    Customer_Type = case_when(
+      RFM_Segment %in% c("Champions","Loyal Customers","Potential Loyalist","Needs Attention") ~ "Core",
+      TRUE ~ "Non-Core"
+    )
+  )
+```
+
+```{r churn-labels}
+# ── 0F. ĐỊNH NGHĨA CHURN (TIERED — kế thừa từ EDA Q2) ───────────────────────
+# Dynamic threshold: Core vs Non-Core khác nhau
+customer_features <- customer_features %>%
+  mutate(
+    Dynamic_Threshold = case_when(
+      Customer_Type == "Whale/B2B" ~ 126,
+      Customer_Type == "Core"      ~ 423,   # ~3 quarters
+      Customer_Type == "Non-Core"  ~ 759,   # ~2 years
+      TRUE                         ~ 411
+    ),
+    is_churned = ifelse(Recency > Dynamic_Threshold, 1, 0),
+
+    # Risk tiers cho báo cáo
+    churn_risk_tier = case_when(
+      Recency <= 90   ~ "Active",
+      Recency <= 180  ~ "At-Risk",
+      Recency <= 365  ~ "High Risk",
+      TRUE            ~ "Critical / Lost"
+    )
+  )
+
+cat("Churn rate (dynamic):", scales::percent(mean(customer_features$is_churned)), "\n")
+```
+
+---
+
+# PHẦN 1 — HIT-AND-RUN TRAJECTORY FORECAST
+
+> **Vấn đề đã phát hiện:** Hit-and-run rate tăng từ 31.8% (2012) lên 78.9% (2020).
+> Phần này project trend này sẽ đi đến đâu nếu không can thiệp.
+
+## 1.1. Cohort Hit-and-Run Rate (Historical)
+
+```{r hit-and-run-cohort}
+# Tính số đơn per customer per cohort year
+cohort_base <- customer_features %>%
+  filter(is_whale == 0, cohort_year >= 2012, cohort_year <= 2021) %>%
+  mutate(
+    is_one_time = ifelse(Frequency == 1, 1, 0)
+  ) %>%
+  group_by(cohort_year) %>%
+  summarise(
+    n_customers      = n(),
+    n_one_time       = sum(is_one_time),
+    hit_and_run_rate = mean(is_one_time),
+    .groups = "drop"
+  )
+
+# Vẽ historical trend
+p1 <- ggplot(cohort_base, aes(x = cohort_year, y = hit_and_run_rate)) +
+  geom_line(color = "#E74C3C", linewidth = 1.3) +
+  geom_point(color = "#E74C3C", size = 3) +
+  geom_smooth(method = "lm", se = TRUE, linetype = "dashed",
+              color = "#922B21", fill = "#F5B7B1", alpha = 0.3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_x_continuous(breaks = 2012:2021) +
+  labs(
+    title    = "Hit-and-Run Rate by Acquisition Cohort",
+    subtitle = "% khách hàng chỉ mua đúng 1 lần — trend tăng đều không có điểm đảo chiều",
+    x = "Cohort Year (Year of First Purchase)",
+    y = "Hit-and-Run Rate (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+p1
+```
+
+## 1.2. Linear Forecast — Hit-and-Run Rate 2023–2026
+
+```{r har-forecast}
+# Fit linear model trên historical data
+
+# 1. Lọc lấy historical data "Sạch" (Chỉ lấy đến 2019 để tránh Maturity Bias của 2020-2022)
+# Khách 2021-2022 chưa đủ thời gian để quay lại nên số liệu HAR bị cao ảo -> PHẢI BỎ.
+cohort_train <- cohort_base %>% 
+  filter(cohort_year <= 2019) 
+
+# 2. Dùng GLM với family = quasibinomial (Dành riêng cho tỷ lệ % từ 0 đến 1)
+# Nó sẽ dự báo theo đường cong, càng gần 100% nó càng tăng chậm lại
+har_model_curve <- glm(hit_and_run_rate ~ cohort_year, 
+                       data = cohort_train, 
+                       family = quasibinomial)
+
+# 3. Tiến hành dự báo cho tương lai
+future_years <- data.frame(cohort_year = 2020:2026)
+har_forecast <- future_years %>%
+  mutate(
+    # predict với type = "response" để trả về giá trị % trực tiếp
+    hit_and_run_rate = predict(har_model_curve, newdata = future_years, type = "response"),
+    type = "Forecast (No Intervention)"
+  )
+
+# 4. Gộp data (Historical chỉ lấy đến 2019 để biểu đồ trông logic)
+cohort_all <- bind_rows(
+  cohort_base %>% filter(cohort_year <= 2019) %>% mutate(type = "Historical"),
+  har_forecast
+)
+
+# 5. Vẽ lại chart (Bỏ pmin đi để thấy đường cong tự nhiên)
+p2 <- ggplot(cohort_all, aes(x = cohort_year, y = hit_and_run_rate, 
+                               color = type, linetype = type)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = 2019.5, linetype = "dotted", color = "gray50") +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_x_continuous(breaks = 2012:2026) +
+  scale_color_manual(values = c("Historical" = "#2C3E50", 
+                                 "Forecast (No Intervention)" = "#E74C3C")) +
+  labs(
+    title    = "Hit-and-Run Rate Forecast: Logistic Growth Model",
+    subtitle = "Mô hình đường cong S: Tỷ lệ HAR tăng dần và tiệm cận ngưỡng bão hòa",
+    x = "Cohort Year", y = "Hit-and-Run Rate (%)"
+  ) +
+  theme_minimal()
+
+p2
+
+# Print forecast table
+har_forecast %>%
+  mutate(hit_and_run_rate = scales::percent(hit_and_run_rate, accuracy = 0.1)) %>%
+  select(`Cohort Year` = cohort_year,
+         `Forecasted Hit-and-Run Rate` = hit_and_run_rate) %>%
+  kable(caption = "Dự báo Hit-and-Run Rate theo Cohort (No Intervention Scenario)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# PHẦN 2 — CHURN PREDICTION MODEL (XGBoost)
+
+> **Core model:** Predict xác suất churn của từng customer → phân loại rủi ro → prioritise win-back.
+
+## 2.1. Feature Engineering & Data Prep
+
+```{r churn-feature-prep}
+# Tập ML: chỉ dùng Non-Whale, có đủ data
+ml_base <- customer_features %>%
+  filter(is_whale == 0, !is.na(AOV), !is.na(avg_gap_days) | Frequency == 1) %>%
+  mutate(
+    # Impute gap = 999 cho one-time buyer (chưa có purchase cadence)
+    avg_gap_days        = ifelse(is.na(avg_gap_days), 999, avg_gap_days),
+    log_monetary        = log1p(Monetary),
+    log_frequency       = log1p(Frequency),
+    log_recency         = log1p(Recency),
+    log_aov             = log1p(AOV),
+    log_tenure          = log1p(tenure_days),
+    monetary_per_tenure = ifelse(tenure_days > 0, Monetary / tenure_days, 0),
+    
+    # Categorical encoding
+    is_churned          = as.factor(is_churned),
+    acquisition_channel = as.factor(acquisition_channel),
+    age_group           = as.factor(age_group),
+    gender              = as.factor(gender),
+    Customer_Type       = as.factor(Customer_Type),
+    RFM_Segment         = as.factor(RFM_Segment)
+  ) %>%
+  select(
+    customer_id, is_churned,
+    # RFM transformed
+    log_recency, log_frequency, log_monetary, log_aov,
+    # RFM scores (numeric — continuous signal cho XGBoost)
+    R_Score, F_Score, M_Score, RFM_Score,
+    # Behaviour
+    log_tenure, avg_gap_days, n_unique_products,
+    promo_dependency, avg_quantity, monetary_per_tenure,
+    # Categorical — bao gồm RFM_Segment
+    acquisition_channel, age_group, gender, cohort_year,
+    RFM_Segment,
+    # Raw (for inspection / scoring output)
+    Recency, Frequency, Monetary, Customer_Type
+  ) %>%
+  drop_na(is_churned)
+
+cat("ML dataset size:", nrow(ml_base), "customers\n")
+cat("Churn rate in ML set:", scales::percent(mean(ml_base$is_churned == "1")), "\n")
+```
+
+## 2.2. Train / Test Split & Recipe
+
+```{r churn-split}
+set.seed(2024)
+
+# Stratified split để giữ churn proportion
+churn_split <- initial_split(ml_base, prop = 0.80, strata = is_churned)
+train_data  <- training(churn_split)
+test_data   <- testing(churn_split)
+
+# Preprocessing recipe
+churn_recipe <- recipe(is_churned ~ ., data = train_data) %>%
+  # Loại bỏ các biến gây Leakage (những thằng biết trước đáp án)
+  step_rm(customer_id, contains("recency"), contains("Score"), contains("Segment")) %>%
+  # Tự động biến tất cả các cột chữ thành số (Dummy)
+  step_dummy(all_nominal_predictors()) %>%
+  # Tự động chuẩn hóa tất cả các cột số
+  step_normalize(all_numeric_predictors()) %>%
+  # Loại bỏ biến có giá trị không đổi
+  step_zv(all_predictors())
+
+cat("Train size:", nrow(train_data), "\n")
+cat("Test size :", nrow(test_data), "\n")
+```
+
+## 2.3. Model Training — XGBoost (Primary) + Logistic Regression (Baseline)
+
+```{r churn-model-train}
+# ── XGBoost ───────────────────────────────────────────────────────────────────
+xgb_spec <- boost_tree(
+  trees          = 500,
+  tree_depth     = 6,
+  min_n          = 10,
+  loss_reduction = 0.001,
+  sample_size    = 0.8,
+  # mtry = 0.7,  <-- XÓA DÒNG NÀY Ở ĐÂY
+  learn_rate     = 0.02
+) %>%
+  set_engine("xgboost", 
+             eval_metric = "logloss",
+             colsample_bynode = 0.7) %>% # <-- ĐƯA VÀO ĐÂY (Engine-specific parameter)
+  set_mode("classification")
+
+xgb_workflow <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(xgb_spec)
+
+xgb_fit <- xgb_workflow %>% fit(data = train_data)
+
+# ── Logistic Regression (Baseline) ───────────────────────────────────────────
+logit_spec <- logistic_reg(penalty = 0.01, mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+logit_workflow <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(logit_spec)
+
+logit_fit <- logit_workflow %>% fit(data = train_data)
+
+cat("✓ Models trained\n")
+```
+
+## 2.4. Evaluation — AUC, Precision, Recall
+
+```{r churn-eval}
+# 2.4. MODEL EVALUATION — COMPARISON DASHBOARD
+# ==========================================
+
+library(yardstick)
+library(ggplot2)
+library(kableExtra)
+library(dplyr)
+library(tidyr)
+
+# 1. Định nghĩa bộ metric chuẩn (ép dùng yardstick để tránh lỗi caret)
+eval_metrics <- yardstick::metric_set(
+  yardstick::accuracy, 
+  yardstick::precision, 
+  yardstick::recall, 
+  yardstick::f_meas
+)
+
+# 2. Tính toán Metric cho cả 2 Model để so sánh
+metrics_xgb <- eval_metrics(xgb_preds, truth = is_churned, estimate = .pred_class) %>%
+  mutate(model = "XGBoost (Primary)")
+
+metrics_logit <- eval_metrics(logit_preds, truth = is_churned, estimate = .pred_class) %>%
+  mutate(model = "Logistic (Baseline)")
+
+# 3. Tính AUC riêng
+auc_xgb   <- yardstick::roc_auc(xgb_preds, truth = is_churned, .pred_1)
+auc_logit <- yardstick::roc_auc(logit_preds, truth = is_churned, .pred_1)
+
+# 4. Gộp kết quả vào một Bảng so sánh (Đẹp)
+comparison_table <- bind_rows(metrics_xgb, metrics_logit) %>%
+  select(model, .metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  mutate(auc = c(auc_xgb$.estimate, auc_logit$.estimate))
+
+# Hiển thị bảng kết quả chuyên nghiệp
+comparison_table %>%
+  kable(caption = "Model Performance Comparison", digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(1, bold = TRUE, color = "white", background = "#D35400") # Highlight XGBoost
+
+# 5. VẼ BIỂU ĐỒ ROC CURVE (ĐÃ TINH CHỈNH)
+xgb_roc_data   <- yardstick::roc_curve(xgb_preds, truth = is_churned, .pred_1)
+logit_roc_data <- yardstick::roc_curve(logit_preds, truth = is_churned, .pred_1)
+
+ggplot() +
+  geom_path(data = xgb_roc_data, aes(x = 1 - specificity, y = sensitivity, color = "XGBoost"), size = 1.5) +
+  geom_path(data = logit_roc_data, aes(x = 1 - specificity, y = sensitivity, color = "Logistic"), linetype = "dashed", size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "gray60") +
+  scale_color_manual(values = c("XGBoost" = "#E67E22", "Logistic" = "#3498DB")) +
+  labs(
+    title = "ROC Curve: Churn Prediction Accuracy",
+    subtitle = paste0("XGBoost AUC: ", round(auc_xgb$.estimate, 3), " | Logistic AUC: ", round(auc_logit$.estimate, 3)),
+    x = "Tỷ lệ báo động giả (1 - Specificity)",
+    y = "Tỷ lệ bắt được khách Churn (Sensitivity)",
+    color = "Mô hình:"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top", plot.title = element_text(face = "bold", size = 14))
+```
+
+## 2.5. Feature Importance — Why Do Customers Churn?
+
+```{r feature-importance}
+vip(xgb_fit, num_features = 16, geom = "col") +
+  aes(fill = Importance) +
+  scale_fill_gradient(low = "#F5CBA7", high = "#E74C3C") +
+  labs(
+    title    = "Feature Importance — Churn Prediction (XGBoost)",
+    subtitle = "Biến nào quyết định việc khách hàng rời bỏ? (bao gồm R/F/M scores & RFM Segment dummies)",
+    x        = "Feature",
+    y        = "Importance Score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none")
+```
+
+## 2.6. Churn Rate & Churn Probability by RFM Segment
+
+```{r churn-by-segment}
+# ── Actual churn rate per segment (ground truth từ dynamic threshold) ─────────
+seg_churn_actual <- customer_features %>%
+  filter(is_whale == 0, !is.na(RFM_Segment), RFM_Segment != "Others") %>%
+  group_by(RFM_Segment) %>%
+  summarise(
+    n_customers      = n(),
+    churn_rate_actual = mean(is_churned, na.rm = TRUE),
+    median_recency   = median(Recency, na.rm = TRUE),
+    median_monetary  = median(Monetary, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(churn_rate_actual))
+
+# ── Predicted churn probability per segment (BẢN FIX LỖI RAM) ────────────────
+
+# 1. Dự báo xác suất cho toàn bộ tập ml_base
+# Lưu ý: .pred_churned là tên cột mặc định nếu nhãn của mày là "churned"
+predictions <- xgb_fit %>% 
+  predict(ml_base, type = "prob")
+
+# 2. Dán cột xác suất vào ml_base và tính trung bình theo Segment
+seg_churn_pred <- ml_base %>%
+  # Dùng bind_cols vì thứ tự dòng là khớp 100%
+  bind_cols(predictions) %>%
+  # Đổi tên cột dự báo cho khớp với code phía dưới của mày
+  # Nếu nhãn là 1/0 thì dùng .pred_1, nếu nhãn là churned/active thì dùng .pred_churned
+  rename(churn_prob = matches(".pred_1|.pred_churned")) %>% 
+  filter(!is.na(RFM_Segment), RFM_Segment != "Others") %>%
+  group_by(RFM_Segment) %>%
+  summarise(avg_churn_prob = mean(churn_prob, na.rm = TRUE), .groups = "drop")
+
+# Gộp lại
+seg_churn_full <- seg_churn_actual %>%
+  left_join(seg_churn_pred, by = "RFM_Segment") %>%
+  mutate(
+    # Màu theo mức độ nguy hiểm
+    danger_score = churn_rate_actual * median_monetary,
+    RFM_Segment  = fct_reorder(RFM_Segment, churn_rate_actual)
+  )
+
+# ── Chart 1: Actual Churn Rate by Segment ─────────────────────────────────────
+p_seg_churn <- ggplot(seg_churn_full,
+                      aes(x = RFM_Segment, y = churn_rate_actual,
+                          fill = churn_rate_actual)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = scales::percent(churn_rate_actual, accuracy = 0.1)),
+            hjust = -0.15, size = 3.5, fontface = "bold") +
+  scale_fill_gradient(low = "#F9E79F", high = "#C0392B") +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1.1)) +
+  coord_flip() +
+  labs(
+    title    = "Actual Churn Rate by RFM Segment",
+    subtitle = "Dynamic threshold: Core 324 ngày, Non-Core 675 ngày",
+    x        = NULL,
+    y        = "Churn Rate",
+    fill     = "Churn Rate"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none")
+
+# ── Chart 2: Predicted Churn Prob vs Actual Churn Rate ────────────────────────
+p_seg_compare <- seg_churn_full %>%
+  pivot_longer(cols = c(churn_rate_actual, avg_churn_prob),
+               names_to = "metric", values_to = "value") %>%
+  # Dùng case_match để thay thế văn bản cực kỳ an toàn
+  mutate(metric = case_match(metric,
+    "churn_rate_actual" ~ "Actual Churn Rate",
+    "avg_churn_prob"    ~ "Predicted Churn Prob (XGBoost)",
+    .default = metric # Giữ nguyên nếu không khớp cái nào
+  )) %>%
+  ggplot(aes(x = RFM_Segment, y = value, fill = metric)) +
+  geom_col(position = "dodge", width = 0.7, alpha = 0.85) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1.05)) +
+  scale_fill_manual(values = c(
+    "Actual Churn Rate"              = "#2C3E50",
+    "Predicted Churn Prob (XGBoost)" = "#E74C3C"
+  )) +
+  coord_flip() +
+  labs(
+    title    = "Actual vs Predicted Churn: Calibration by Segment",
+    subtitle = "Model dự báo có khớp với thực tế không theo từng segment?",
+    x        = NULL,
+    y        = "Rate / Probability",
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top")
+
+p_seg_churn / p_seg_compare
+
+# ── Table: Full Segment Risk Summary ──────────────────────────────────────────
+seg_churn_full %>%
+  arrange(desc(churn_rate_actual)) %>%
+  mutate(
+    churn_rate_actual = scales::percent(churn_rate_actual, accuracy = 0.1),
+    avg_churn_prob    = scales::percent(avg_churn_prob,    accuracy = 0.1),
+    median_recency    = round(median_recency, 0),
+    median_monetary   = scales::dollar(median_monetary, big.mark = ",", prefix = ""),
+    danger_score      = scales::dollar(danger_score,    big.mark = ",", prefix = "")
+  ) %>%
+  select(RFM_Segment, n_customers, churn_rate_actual, avg_churn_prob,
+         median_recency, median_monetary, danger_score) %>%
+  kable(
+    caption   = "Churn Risk by RFM Segment — Actual vs Predicted",
+    col.names = c("RFM Segment", "# Customers", "Actual Churn Rate",
+                  "Avg Predicted Prob", "Median Recency (days)",
+                  "Median Monetary", "Danger Score")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(1:3, bold = TRUE, color = "white", background = "#C0392B")
+```
+
+## 2.7. Churn Probability Distribution — Risk Tier Scoring
+
+```{r churn-scoring}
+# Tạo scored dataset toàn bộ customers — bao gồm RFM_Segment
+# ==========================================
+# 2.7. REFINED CHURN SCORING (DÀNH CHO CHIẾN THUẬT)
+# ==========================================
+
+# 1. Dự báo xác suất cho TOÀN BỘ (nhưng dùng model đã bỏ Recency)
+all_preds_raw <- bind_cols(
+  ml_base %>% select(customer_id, is_churned, Monetary, Customer_Type, Recency, RFM_Segment),
+  xgb_fit %>% predict(ml_base, type = "prob")
+) %>%
+  rename(churn_prob = matches(".pred_1|.pred_churned"))
+
+# 2. PHÂN LOẠI CHIẾN THUẬT
+all_preds <- all_preds_raw %>%
+  mutate(
+    risk_tier = case_when(
+      # Nếu thực tế đã vượt ngưỡng churn -> Coi như rụng hẳn (Dead)
+      is_churned == 1 ~ "Already Lost", 
+      
+      # Chỉ phân tầng rủi ro cho những người ĐANG CÒN HOẠT ĐỘNG
+      churn_prob >= 0.80 ~ "Critical (At Risk)",
+      churn_prob >= 0.60 ~ "High Risk",
+      churn_prob >= 0.40 ~ "Medium Risk",
+      TRUE              ~ "Low Risk"
+    ),
+    risk_tier = factor(risk_tier, 
+                       levels = c("Low Risk", "Medium Risk", "High Risk", "Critical (At Risk)", "Already Lost"))
+  )
+
+# 3. Vẽ lại biểu đồ phân bố (Sẽ thấy sự phân tầng rõ rệt của nhóm Active)
+ggplot(all_preds %>% filter(risk_tier != "Already Lost"), 
+       aes(x = churn_prob, fill = risk_tier)) +
+  geom_histogram(binwidth = 0.05, color = "white", alpha = 0.8) +
+  scale_fill_manual(values = c("Low Risk" = "#2ECC71", "Medium Risk" = "#F1C40F", 
+                               "High Risk" = "#E67E22", "Critical (At Risk)" = "#C0392B")) +
+  labs(title = "Churn Risk Probability for ACTIVE Customers",
+       subtitle = "Bỏ qua nhóm đã rời bỏ hẳn để tập trung vào nhóm 'cần cứu vãn'",
+       x = "Xác suất rời bỏ (Dự báo dựa trên hành vi mua sắm & Promo)",
+       y = "Số lượng khách hàng") +
+  theme_minimal()
+```
+
+## 2.7. Churn Risk × Monetary Value — The Revenue at Stake Matrix
+
+```{r revenue-at-stake}
+# Key insight: High Monetary x High Churn Prob = most dangerous zone
+# 1. Tính ngưỡng Monetary (Top 25%)
+monetary_threshold <- quantile(all_preds$Monetary, 0.75, na.rm = TRUE)
+
+monetary_threshold
+# 2. Lưu object chứa khách hàng Danger Zone (High Value + Churn Prob > 60%)
+danger_zone_customers <- all_preds %>%
+  filter(Monetary >= monetary_threshold, 
+         churn_prob >= 0.60)
+
+# 3. Vẽ lại biểu đồ với Legend to rõ
+p_matrix_fixed <- ggplot(all_preds %>% filter(Monetary > 0),
+       aes(x = churn_prob, y = log1p(Monetary), color = risk_tier)) +
+  geom_point(alpha = 0.2, size = 0.8) +
+  geom_vline(xintercept = 0.60, linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = log1p(monetary_threshold), linetype = "dashed", color = "gray50") +
+  # Phóng to dot ở Legend bằng guides()
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 4))) +
+  scale_color_manual(values = c("Low Risk"    = "#2ECC71",
+                                "Medium Risk" = "#F39C12",
+                                "High Risk"   = "#E67E22",
+                                "Critical"    = "#C0392B")) +
+  scale_x_continuous(labels = percent_format()) +
+  labs(title = "Churn Risk × Monetary Value Matrix",
+       subtitle = paste0("Danger Zone: ", nrow(danger_zone_customers), " customers identified"),
+       x = "Churn Probability", y = "Log(Monetary Value)") +
+  annotate("rect",
+           xmin = 0.60, xmax = 1.00,
+           ymin = quantile(log1p(all_preds$Monetary), 0.75, na.rm = TRUE),
+           ymax = max(log1p(all_preds$Monetary), na.rm = TRUE),
+           alpha = 0.1, fill = "red") +
+  annotate("text", x = 0.80, y = max(log1p(all_preds$Monetary), na.rm = TRUE) * 0.99,
+           label = "⚠ DANGER ZONE\nHigh Value × High Churn",
+           color = "darkred", fontface = "bold", size = 3.5, vjust = 1) +
+  theme_minimal()
+
+print(p_matrix_fixed)
+```
+
+## 2.8. Profile nhóm dễ Churn
+```{r 28,echo=FALSE}
+# =====================================================================
+# 2. DESCRIPTIVE ANALYTICS CHO NHÓM DANGER ZONE
+# =====================================================================
+
+# Join danh sách Danger Zone với bảng customer_features để lấy demo/behavior
+# Bây giờ mới tạo cái object "huyền thoại" này:
+danger_zone_ids <- all_preds %>%
+  filter(Monetary >= 206792.4,    # Lấy nhóm giàu (Top 25%)
+         churn_prob >= 0.60)             # Lấy nhóm nguy cơ cao (Prob >= 60%)
+
+dz_profile <- danger_zone_ids %>%
+  left_join(customer_features, by = "customer_id")
+
+# 2.1. Phân bổ theo Demographic (Ai dễ rụng nhất?)
+cat("--- TOP GENDER & AGE GROUP TRONG DANGER ZONE ---\n")
+dz_profile %>% count(gender, age_group) %>% arrange(desc(n)) 
+
+# 2.2. Phân bổ theo Kênh Acquisition (Kênh nào mang về khách 'giàu nhưng nhanh chán'?)
+p_dz_channel <- dz_profile %>%
+  filter(!is.na(acquisition_channel)) %>%
+  count(acquisition_channel) %>%
+  ggplot(aes(x = reorder(acquisition_channel, n), y = n, fill = acquisition_channel)) +
+  geom_col() + coord_flip() +
+  labs(title = "Danger Zone by Acquisition Channel", x = NULL, y = "Count") +
+  theme_minimal() + theme(legend.position = "none")
+
+p_dz_channel
+
+# 2.3. Hành vi Promo & Sản phẩm (Họ có 'nghiện' giảm giá không?)
+avg_promo_dz <- mean(dz_profile$promo_dependency, na.rm = TRUE)
+cat(sprintf("\nTỷ lệ phụ thuộc khuyến mãi trung bình của nhóm Danger Zone: %.1f%%\n", avg_promo_dz * 100))
+
+# Top Category mà nhóm Danger Zone hay mua
+# 1. Lấy tất cả giao dịch của những khách hàng nằm trong Danger Zone
+dz_transactions <- df3 %>%
+  filter(customer_id %in% danger_zone_ids$customer_id) %>%
+  # Chỉ lấy đơn thành công nếu cần (delivered)
+  filter(order_status == "delivered") 
+
+# 2. Vẽ biểu đồ: Ngành hàng nào đóng góp nhiều doanh thu/số lượng nhất từ nhóm DZ?
+p_dz_cat <- dz_transactions %>%
+  filter(!is.na(category), category != "") %>%
+  group_by(category) %>%
+  summarise(
+    n_orders = n(),
+    total_rev = sum(quantity*unit_price, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Sắp xếp theo số lượng đơn hàng cho dễ nhìn
+  mutate(category = fct_reorder(category, n_orders)) %>%
+  ggplot(aes(x = category, y = n_orders, fill = category)) +
+  geom_col() + 
+  # Thêm nhãn số lượng đơn ngay trên đầu cột
+  geom_text(aes(label = comma(n_orders)), hjust = -0.2, size = 3.5, fontface = "bold") +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) + # Tránh mất nhãn text
+  labs(
+    title = "Top Categories in Danger Zone (by Transaction)",
+    subtitle = "Ngành hàng mà nhóm khách High-Value At-Risk mua nhiều nhất",
+    x = NULL, y = "Số lượng giao dịch (Total Orders)"
+  ) +
+  theme_minimal() + 
+  theme(legend.position = "none", plot.title = element_text(face = "bold"))
+
+print(p_dz_cat)
+
+# Ghép hình
+(p_dz_channel | p_dz_cat)
+
+# =====================================================================
+# PHÂN TÍCH RFM SEGMENT CỦA NHÓM DANGER ZONE
+# =====================================================================
+
+# 1. Tính toán bảng phân bổ (Sử dụng object danger_zone_ids đã tạo ở bước trước)
+# Nếu RFM_Segment chưa có trong danger_zone_ids, hãy chạy dòng join dưới đây:
+# danger_zone_ids <- danger_zone_ids %>% left_join(all_preds %>% select(customer_id, RFM_Segment), by = "customer_id")
+
+dz_rfm_summary <- danger_zone_ids %>%
+  filter(!is.na(RFM_Segment), RFM_Segment != "Others") %>%
+  count(RFM_Segment) %>%
+  mutate(pct = n / sum(n)) %>%
+  arrange(desc(n))
+
+# 2. In bảng thống kê ra console để xem số liệu nhanh
+cat("--- PHÂN BỔ RFM SEGMENT TRONG VÙNG DANGER ZONE ---\n")
+print(dz_rfm_summary)
+
+# 3. Vẽ biểu đồ Bar Chart để so sánh
+p_dz_rfm <- ggplot(dz_rfm_summary, aes(x = reorder(RFM_Segment, n), y = n, fill = RFM_Segment)) +
+  geom_col(width = 0.7) +
+  # Thêm label: Số lượng khách (phần trăm)
+  geom_text(aes(label = paste0(comma(n), " (", percent(pct, accuracy = 0.1), ")")), 
+            hjust = -0.1, size = 3.5, fontface = "bold") +
+  coord_flip() +
+  # Sử dụng bảng màu seg_colors mày đã định nghĩa ở đầu file Rmd (nếu có)
+  # Nếu không có seg_colors, R sẽ dùng màu mặc định
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(title = "RFM Segment Distribution in Danger Zone",
+       subtitle = "Những nhóm khách hàng 'nòng cốt' nào đang có nguy cơ rời bỏ cao nhất?",
+       x = NULL, y = "Số lượng khách hàng (Count)") +
+  theme_minimal() +
+  theme(legend.position = "none", 
+        plot.title = element_text(face = "bold"),
+        axis.text = element_text(face = "bold"))
+
+print(p_dz_rfm)
+```
+---
+
+# PHẦN 3 — SURVIVAL ANALYSIS: CUSTOMER LIFETIME (Time-to-Churn)
+
+> **Tại sao cần Survival Analysis?** Churn Model (XGBoost) cho biết *ai có khả năng churn*.
+> Survival Analysis cho biết *khi nào họ sẽ churn* — dự báo thời điểm cụ thể.
+
+## 3.1. Kaplan-Meier Survival Curve by Customer Type
+
+```{r survival-km}
+# Survival object: time = tenure_days, event = is_churned (binary)
+surv_data <- customer_features %>%
+  filter(is_whale == 0) %>%
+  mutate(
+    time_days  = pmax(tenure_days, 1),
+    event_flag = is_churned  # 1 = churned (event observed)
+  ) %>%
+  select(customer_id, time_days, event_flag, Customer_Type,
+         acquisition_channel, cohort_year, Frequency)
+
+surv_obj  <- Surv(time = surv_data$time_days, event = surv_data$event_flag)
+km_by_type <- survfit(surv_obj ~ Customer_Type, data = surv_data)
+
+# Plot KM curves
+ggsurvplot(
+  km_by_type,
+  data          = surv_data,
+  conf.int      = TRUE,
+  pval          = TRUE,
+  risk.table    = TRUE,
+  palette       = c("#2ECC71", "#E74C3C"),
+  xlab          = "Days Since First Purchase",
+  ylab          = "Survival Probability (Still Active)",
+  title         = "Kaplan-Meier Survival Curve by Customer Type",
+  subtitle      = "Core customers retain significantly longer than Non-Core",
+  legend.labs   = c("Core", "Non-Core"),
+  ggtheme       = theme_minimal(base_size = 12)
+)
+```
+
+## 3.2. Survival by Acquisition Channel
+
+```{r survival-channel}
+km_by_channel <- survfit(surv_obj ~ acquisition_channel, data = surv_data)
+
+ggsurvplot(
+  km_by_channel,
+  data        = surv_data,
+  conf.int    = FALSE,
+  pval        = TRUE,
+  palette     = "Dark2",
+  xlab        = "Days Since First Purchase",
+  ylab        = "Survival Probability",
+  title       = "Survival Curve by Acquisition Channel",
+  subtitle    = "Kênh nào mang về customers sống lâu hơn?",
+  ggtheme     = theme_minimal(base_size = 12),
+  legend.title = "Channel"
+)
+```
+
+## 3.3. Median Survival Time by Cohort Year
+
+```{r survival-cohort}
+# =====================================================================
+# 3.3. Survival Rate at Milestone (1-Year Retention) by Cohort
+# =====================================================================
+
+# Thay vì lấy Median (thứ dễ bị NA), ta lấy % khách còn Active sau đúng 365 ngày
+surv_cohort_results <- surv_data %>%
+  filter(cohort_year <= 2020) %>%
+  group_by(cohort_year) %>%
+  group_modify(~ {
+    so <- Surv(time = .x$time_days, event = .x$event_flag)
+    km <- survfit(so ~ 1)
+    
+    # Tính survival probability tại mốc 365 ngày
+    # Nếu cohort quá mới (chưa đủ 365 ngày) thì sẽ trả về NA tự nhiên
+    s_summary <- summary(km, times = 411)
+    
+    tibble(
+      n = nrow(.x),
+      surv_at_1yr = if(length(s_summary$surv) > 0) s_summary$surv else NA,
+      lower_ci    = if(length(s_summary$lower) > 0) s_summary$lower else NA,
+      upper_ci    = if(length(s_summary$upper) > 0) s_summary$upper else NA
+    )
+  }) %>%
+  ungroup() %>%
+  # Chỉ lọc những năm có dữ liệu hợp lệ
+  filter(!is.na(surv_at_1yr))
+
+# Vẽ biểu đồ Survival Rate
+ggplot(surv_cohort_results, aes(x = cohort_year, y = surv_at_1yr)) +
+  geom_line(color = "#E74C3C", linewidth = 1.3) + # Màu đỏ cho nó "máu"
+  geom_point(color = "#E74C3C", size = 3) +
+  geom_ribbon(aes(ymin = lower_ci, ymax = upper_ci), fill = "#FADBD8", alpha = 0.5) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_x_continuous(breaks = min(surv_cohort_results$cohort_year):max(surv_cohort_results$cohort_year)) +
+  labs(
+    title    = "1-Year Survival Rate by Acquisition Cohort",
+    subtitle = "Tỷ lệ khách hàng còn hoạt động sau 1 năm đang giảm dần qua các năm",
+    x = "Năm đăng ký (Cohort Year)",
+    y = "% Khách hàng còn Active (sau 365 ngày)",
+    caption = "Vùng bóng mờ: 95% Confidence Interval"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+---
+
+# PHẦN 4 — REVENUE AT RISK FORECAST (12-Month Forward)
+
+> **Câu hỏi:** Nếu không có can thiệp, bao nhiêu revenue sẽ mất trong 12 tháng tới?
+
+## 4.1. Tính Revenue at Risk từ High/Critical Risk Tier
+
+```{r revenue-at-risk}
+# Revenue at Risk = Monetary × Churn Probability (expected loss)
+revenue_at_risk <- all_preds %>%
+  mutate(
+    revenue_at_risk   = Monetary * churn_prob,
+    expected_retained = Monetary * (1 - churn_prob)
+  ) %>%
+  group_by(risk_tier) %>%
+  summarise(
+    n_customers         = n(),
+    total_monetary      = sum(Monetary, na.rm = TRUE),
+    total_at_risk       = sum(revenue_at_risk, na.rm = TRUE),
+    total_expected_loss = sum(revenue_at_risk, na.rm = TRUE),
+    expected_retained   = sum(expected_retained, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Overall
+total_rar <- sum(revenue_at_risk$total_at_risk)
+total_rev <- sum(revenue_at_risk$total_monetary)
+
+cat(sprintf("Total Revenue at Risk (12-month): %s\n",
+            scales::dollar(total_rar, big.mark = ",")))
+
+# SỬA Ở ĐÂY: Thêm một dấu % nữa vào đầu
+cat(sprintf("%% of Total Revenue at Risk: %s\n",
+            scales::percent(total_rar / total_rev)))
+
+# Visualise
+revenue_at_risk %>%
+  ggplot(aes(x = risk_tier, y = total_at_risk, fill = risk_tier)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = scales::dollar(total_at_risk / 1e6, suffix = "M")),
+            vjust = -0.5, fontface = "bold", size = 4) +
+  scale_fill_manual(values = c("Low Risk"    = "#2ECC71",
+                               "Medium Risk" = "#F39C12",
+                               "High Risk"   = "#E67E22",
+                               "Critical"    = "#C0392B")) +
+  scale_y_continuous(labels = scales::dollar_format(suffix = "M", scale = 1e-6)) +
+  labs(
+    title    = "Revenue at Risk by Risk Tier (Expected Loss)",
+    subtitle = "Revenue at Risk = Monetary × Churn Probability",
+    x        = "Risk Tier",
+    y        = "Revenue at Risk",
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none")
+```
+
+## 4.2. Monthly Revenue Forecast — ARIMA/ETS via fable
+
+```{r revenue-ts-forecast}
+# Tính monthly net revenue
+monthly_revenue <- df_delivered %>%
+  mutate(order_month = yearmonth(order_date)) %>%
+  group_by(order_month) %>%
+  summarise(
+    revenue    = sum(net_revenue, na.rm = TRUE),
+    n_orders   = n_distinct(order_id),
+    n_customers = n_distinct(customer_id),
+    .groups = "drop"
+  ) %>%
+  as_tsibble(index = order_month)
+
+# Fit ETS + ARIMA models
+fit_ts <- monthly_revenue %>%
+  model(
+    ETS   = ETS(revenue),
+    ARIMA = ARIMA(revenue)
+  )
+
+# Forecast 18 months ahead
+fc_ts <- fit_ts %>% forecast(h = "18 months")
+
+# Plot
+autoplot(fc_ts, monthly_revenue, level = c(80, 95), alpha = 0.6) +
+  scale_y_continuous(labels = scales::dollar_format(scale = 1e-6, suffix = "M")) +
+  scale_color_manual(values = c("ETS" = "#2980B9", "ARIMA" = "#E74C3C")) +
+  scale_fill_manual(values  = c("ETS" = "#AED6F1", "ARIMA" = "#F5B7B1")) +
+  labs(
+    title    = "Revenue Forecast: ETS vs ARIMA (18-Month Horizon)",
+    subtitle = "No-intervention scenario — dự báo dựa trên trend hiện tại",
+    x        = "Month",
+    y        = "Net Revenue",
+    color    = "Model",
+    fill     = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+# Model accuracy
+accuracy(fit_ts) %>%
+  select(.model, RMSE, MAE, MAPE) %>%
+  kable(caption = "Time Series Model Accuracy (In-Sample)",
+        digits = 2) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+---
+
+# PHẦN 5 — PRESCRIPTIVE PIPELINE & SCENARIO SIMULATION
+
+> **Mục tiêu:** Simulate "what happens if we intervene?" — so sánh với no-intervention baseline.
+
+## 5.1. Win-Back Priority Scoring
+
+```{r winback-priority}
+# Priority Score = Expected Revenue Saved = Monetary × Churn Prob × P(Win-Back)
+# P(Win-Back) theo RFM Segment — granular hơn Customer_Type vì cùng "Core"
+# nhưng Champions vs Needs Attention có khả năng quay lại rất khác nhau
+
+winback_prob_lookup <- tibble(
+  RFM_Segment = c("Champions", "Loyal Customers", "Can't Lose Them",
+                  "Potential Loyalist", "Needs Attention", "About To Sleep",
+                  "Recent Users", "Promising", "Hibernating",
+                  "Price Sensitive", "Lost", "Others"),
+  p_winback   = c(0.50, 0.42, 0.40,
+                  0.35, 0.28, 0.22,
+                  0.20, 0.18, 0.15,
+                  0.10, 0.06, 0.08)
+  # Logic: segment có R cao hơn (mua gần hơn) → dễ win-back hơn
+  # Can't Lose Them: monetary cao nhưng đã lâu → vẫn worth trying
+)
+
+winback_candidates <- all_preds %>%
+  filter(risk_tier %in% c("High Risk", "Critical")) %>%
+  left_join(
+    customer_features %>% select(customer_id,Frequency,
+                                  first_order, last_order, tenure_days,
+                                  R_Score, F_Score, M_Score),
+    by = "customer_id"
+  ) %>%
+  left_join(winback_prob_lookup, by = "RFM_Segment") %>%
+  mutate(
+    p_winback              = replace_na(p_winback, 0.10),
+    expected_revenue_saved = Monetary * churn_prob * p_winback,
+    priority_score         = expected_revenue_saved,
+
+    # Action mapping theo RFM Segment — granular hơn Core/Non-Core
+    recommended_action = case_when(
+      RFM_Segment == "Champions" & churn_prob >= 0.60
+        ~ "🔴 VIP Emergency: Personal outreach + Early access deal",
+      RFM_Segment %in% c("Loyal Customers", "Can't Lose Them") & churn_prob >= 0.60
+        ~ "🔴 High-touch win-back: Gọi điện cá nhân + Voucher ≥15%",
+      RFM_Segment == "Needs Attention"
+        ~ "🟠 Email sequence + Bundle sản phẩm đã mua trước",
+      RFM_Segment %in% c("Potential Loyalist", "About To Sleep")
+        ~ "🟠 Frequency nudge: Free shipping + Cross-sell offer",
+      RFM_Segment == "Hibernating"
+        ~ "🟡 Automated win-back: Voucher 10% + Social retargeting",
+      RFM_Segment %in% c("Price Sensitive", "Recent Users")
+        ~ "🟡 Flash sale notification khi có clearance",
+      RFM_Segment == "Lost"
+        ~ "⚪ Zero-cost nurture: Email sinh nhật / Newsletter only",
+      TRUE
+        ~ "🟢 Standard re-engagement email sequence"
+    )
+  ) %>%
+  arrange(desc(priority_score))
+
+# Top 20 win-back candidates
+winback_candidates %>%
+  # 1. Ghép Type từ bảng normal_customers
+  # Chỉ lấy cột customer_id và Customer_Type để tránh bị lặp cột
+  left_join(normal_customers %>% select(customer_id), by = "customer_id") %>%
+  
+  # 2. Logic: Nếu NA (không nằm trong normal_customers) -> Whales
+  mutate(Customer_Type = replace_na(Customer_Type, "Whales")) %>%
+  
+  # 3. Lọc và sắp xếp (giả sử mày muốn lấy những ông cứu được nhiều tiền nhất)
+  arrange(desc(expected_revenue_saved)) %>%
+  head(20) %>%
+  
+  # 4. Chọn cột và Format hiển thị
+  select(customer_id, Customer_Type, RFM_Segment, churn_prob, Monetary, 
+         expected_revenue_saved, recommended_action) %>%
+  mutate(
+    churn_prob             = scales::percent(churn_prob, accuracy = 0.1),
+    Monetary               = scales::dollar(Monetary, big.mark = ",", prefix = ""),
+    expected_revenue_saved = scales::dollar(expected_revenue_saved, big.mark = ",", prefix = "")
+  ) %>%
+  
+  # 5. Xuất bảng kable chuyên nghiệp
+  kable(
+    caption    = "Top 20 Win-Back Candidates — Segmented by Customer Type",
+    col.names  = c("Customer ID", "Customer Type", "RFM_Segment", "Churn Prob", "Total Monetary", 
+                   "Expected Revenue Saved", "Recommended Action"),
+    align      = c("l", "c", "c", "r", "r", "l")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  # Highlight những ông Whales cho sếp chú ý
+  column_spec(2, bold = TRUE, color = ifelse(head(winback_candidates, 20)$Customer_Type == "Whales", "red", "black"))
+
+# =====================================================================
+# 5.2. STRATEGY SUMMARY DASHBOARD
+# =====================================================================
+
+# 1. Tính các hằng số tổng để làm mẫu số cho %
+total_customers_base <- nrow(all_preds)
+total_revenue_base   <- sum(all_preds$Monetary, na.rm = TRUE)
+
+strategy_summary <- winback_candidates %>%
+  group_by(recommended_action) %>%
+  summarise(
+    n_customers       = n(),
+    pct_customer_base = n() / total_customers_base,
+    # Gom các RFM Segment lại thành chuỗi cho dễ nhìn
+    rfm_segments      = paste(unique(RFM_Segment), collapse = ", "),
+    avg_churn_rate    = mean(churn_prob, na.rm = TRUE),
+    total_monetary    = sum(Monetary, na.rm = TRUE),
+    total_saved_abs   = sum(expected_revenue_saved, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # % Saved so với tổng doanh thu toàn công ty (Revenue Share)
+    revenue_share_pct = total_saved_abs / total_revenue_base
+  ) %>%
+  arrange(desc(total_saved_abs))
+
+# 2. Hiển thị bảng kable chuyên nghiệp
+strategy_summary %>%
+  mutate(
+    pct_customer_base = scales::percent(pct_customer_base, accuracy = 0.1),
+    avg_churn_rate    = scales::percent(avg_churn_rate, accuracy = 0.1),
+    total_monetary    = scales::dollar(total_monetary, big.mark = ","),
+    total_saved_abs   = scales::dollar(total_saved_abs, big.mark = ","),
+    revenue_share_pct = scales::percent(revenue_share_pct, accuracy = 0.01)
+  ) %>%
+  select(
+    `Strategy`              = recommended_action,
+    `Customers (#)`         = n_customers,
+    `% of Base`             = pct_customer_base,
+    `RFM Segments`          = rfm_segments,
+    `Mean Churn Prob`       = avg_churn_rate,
+    `Total Monetary`        = total_monetary,
+    `Expected Saved`        = total_saved_abs,
+    `Revenue Share (%)`     = revenue_share_pct
+  ) %>%
+  kable(
+    caption = "Win-Back Strategy Dashboard: Resource Allocation & Impact",
+    align   = c("l", "r", "c", "l", "c", "r", "r", "r")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = TRUE) %>%
+  # Tô màu highlight những chiến dịch "🔴 VIP" và "🔴 High-touch"
+  row_spec(which(grepl("🔴", strategy_summary$recommended_action)), 
+           bold = TRUE, background = "#FDEDEC")
+```
+
+
+
+## 5.2. Scenario Simulation — Intervention vs No-Intervention
+
+```{r scenario-simulation}
+# ── SCENARIO PARAMETERS ───────────────────────────────────────────────────────
+# Người dùng có thể thay đổi các parameters này để simulate
+
+intervention_params <- list(
+  # Scenario A: "Baseline — No Intervention"
+  scenario_A = list(
+    name              = "Baseline (No Intervention)",
+    churn_reduction   = 0.00,  # % churn prob giảm
+    har_rate_target   = NULL,  # Không đổi
+    winback_reached   = 0.00,  # % High/Critical được reach
+    color             = "#C0392B"
+  ),
+
+  # Scenario B: "Moderate — Basic Retention Campaign"
+  scenario_B = list(
+    name              = "Moderate Intervention",
+    churn_reduction   = 0.15,  # Giảm 15% churn probability
+    har_rate_target   = 0.65,  # Target HAR xuống 65%
+    winback_reached   = 0.40,  # Reach 40% High/Critical customers
+    color             = "#F39C12"
+  ),
+
+  # Scenario C: "Aggressive — Full Retention + Win-Back"
+  scenario_C = list(
+    name              = "Aggressive Intervention",
+    churn_reduction   = 0.30,  # Giảm 30% churn probability
+    har_rate_target   = 0.55,
+    winback_reached   = 0.70,  # Reach 70%
+    color             = "#27AE60"
+  )
+)
+
+# ── SIMULATION FUNCTION ────────────────────────────────────────────────────────
+simulate_scenario <- function(scored_data, params) {
+  scored_data %>%
+    mutate(
+      adj_churn_prob  = pmax(0, churn_prob * (1 - params$churn_reduction)),
+      revenue_saved   = ifelse(
+        risk_tier %in% c("High Risk", "Critical"),
+        Monetary * (churn_prob - adj_churn_prob) * params$winback_reached,
+        0
+      ),
+      scenario        = params$name
+    ) %>%
+    summarise(
+      scenario               = first(scenario),
+      total_revenue_base     = sum(Monetary, na.rm = TRUE),
+      total_revenue_retained = sum(Monetary * (1 - adj_churn_prob), na.rm = TRUE),
+      total_revenue_saved    = sum(revenue_saved, na.rm = TRUE),
+      avg_churn_prob         = mean(adj_churn_prob),
+      n_saved_customers      = sum(revenue_saved > 0)
+    )
+}
+
+# Run all scenarios
+scenario_results <- map_dfr(
+  intervention_params,
+  ~ simulate_scenario(all_preds, .)
+)
+
+# ── VISUALISE SCENARIOS ────────────────────────────────────────────────────────
+scenario_plot_data <- scenario_results %>%
+  select(scenario, total_revenue_retained, total_revenue_saved, avg_churn_prob) %>%
+  mutate(
+    scenario = factor(scenario, levels = c("Baseline (No Intervention)",
+                                           "Moderate Intervention",
+                                           "Aggressive Intervention"))
+  )
+
+p_scenario <- ggplot(scenario_plot_data,
+                     aes(x = scenario, y = total_revenue_retained, fill = scenario)) +
+  geom_col(width = 0.55) +
+  geom_text(aes(label = scales::dollar(total_revenue_retained / 1e6,
+                                        suffix = "M", accuracy = 0.1)),
+            vjust = -0.5, fontface = "bold", size = 4.5) +
+  scale_fill_manual(values = c(
+    "Baseline (No Intervention)" = "#C0392B",
+    "Moderate Intervention"      = "#F39C12",
+    "Aggressive Intervention"    = "#27AE60"
+  )) +
+  scale_y_continuous(labels = scales::dollar_format(scale = 1e-6, suffix = "M")) +
+  labs(
+    title    = "Scenario Simulation: Revenue Retained Under Different Intervention Levels",
+    subtitle = "So sánh tổng revenue được giữ lại theo từng kịch bản",
+    x        = NULL,
+    y        = "Projected Revenue Retained",
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none",
+        axis.text.x = element_text(size = 10))
+
+p_scenario
+
+# Revenue Saved vs Baseline table
+scenario_results %>%
+  mutate(
+    revenue_uplift_vs_baseline = total_revenue_retained -
+      scenario_results$total_revenue_retained[1],
+    roi_potential              = revenue_uplift_vs_baseline / total_revenue_base,
+    total_revenue_retained     = scales::dollar(total_revenue_retained, big.mark = ",", prefix = ""),
+    total_revenue_saved        = scales::dollar(total_revenue_saved, big.mark = ",", prefix = ""),
+    revenue_uplift_vs_baseline = scales::dollar(revenue_uplift_vs_baseline, big.mark = ",", prefix = ""),
+    avg_churn_prob             = scales::percent(avg_churn_prob, accuracy = 0.1),
+    roi_potential              = scales::percent(roi_potential, accuracy = 0.1)
+  ) %>%
+  select(scenario, total_revenue_retained, revenue_uplift_vs_baseline,
+         avg_churn_prob, n_saved_customers, roi_potential) %>%
+  kable(
+    caption   = "Scenario Comparison — Revenue Impact of Intervention",
+    col.names = c("Scenario", "Revenue Retained", "Uplift vs Baseline",
+                  "Avg Churn Prob", "# Customers Saved", "ROI Potential")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(1, color = "white", background = "#C0392B") %>%
+  row_spec(2, color = "white", background = "#E67E22") %>%
+  row_spec(3, color = "white", background = "#27AE60")
+```
+
+## 5.3. HAR Rate Reduction Simulation — Cohort Improvement
+
+```{r har-simulation}
+# Simulate: nếu HAR rate được cải thiện về target, thêm bao nhiêu repeat buyers?
+har_sim <- cohort_base %>%
+  bind_rows(har_forecast %>% select(cohort_year, hit_and_run_rate)) %>%
+  mutate(
+    # No intervention
+    har_baseline  = hit_and_run_rate,
+    # Moderate: reduce by 10pp từ 2023 onwards
+    har_moderate  = ifelse(cohort_year >= 2023,
+                           pmax(hit_and_run_rate - 0.10, 0.30),
+                           hit_and_run_rate),
+    # Aggressive: reduce by 20pp
+    har_aggressive = ifelse(cohort_year >= 2023,
+                            pmax(hit_and_run_rate - 0.20, 0.25),
+                            hit_and_run_rate)
+  ) %>%
+  pivot_longer(cols = starts_with("har_"),
+               names_to = "scenario", values_to = "har_rate") %>%
+  mutate(
+    scenario = dplyr::recode(scenario,
+      har_baseline   = "No Intervention",
+      har_moderate   = "Moderate (−10pp)",
+      har_aggressive = "Aggressive (−20pp)"
+    ),
+    line_type = ifelse(cohort_year >= 2023, "Forecast", "Historical")
+  )
+
+ggplot(har_sim, aes(x = cohort_year, y = har_rate,
+                    color = scenario, linetype = line_type)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  geom_vline(xintercept = 2022.5, linetype = "dotted", color = "gray60") +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0.2, 1)) +
+  scale_x_continuous(breaks = 2012:2026) +
+  scale_color_manual(values = c(
+    "No Intervention"  = "#C0392B",
+    "Moderate (−10pp)" = "#F39C12",
+    "Aggressive (−20pp)" = "#27AE60"
+  )) +
+  labs(
+    title    = "Hit-and-Run Rate: Intervention Simulation",
+    subtitle = "Intervention nhắm vào onboarding & early retention có thể kéo HAR rate xuống",
+    x        = "Cohort Year",
+    y        = "Hit-and-Run Rate (%)",
+    color    = "Scenario",
+    linetype = "Data Type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top")
+```
+
+---
+
+# PHẦN 6 — MASTER PRIORITY LIST (Export-ready)
+
+```{r master-priority}
+# Bảng tổng hợp: High/Critical risk customers với full context để action
+master_list <- winback_candidates %>%
+  left_join(
+    customer_features %>%
+      select(customer_id, Recency, Frequency, Monetary, cohort_year,
+             acquisition_channel, age_group, gender, Customer_Type,
+             R_Score, F_Score, M_Score, RFM_Segment),
+    by = "customer_id", suffix = c("", ".feat")
+  ) %>%
+  mutate(
+    months_inactive = round(Recency / 30, 1),
+    priority_rank   = row_number(),
+    # Lấy RFM_Segment từ all_preds nếu .feat trùng
+    RFM_Segment     = coalesce(RFM_Segment, RFM_Segment.feat)
+  ) %>%
+  select(
+    priority_rank, customer_id, RFM_Segment, Customer_Type,
+    R_Score, F_Score, M_Score,
+    churn_prob, risk_tier, p_winback,
+    Recency, months_inactive, Frequency, Monetary,
+    expected_revenue_saved, recommended_action,
+    acquisition_channel, age_group, cohort_year
+  ) %>%
+  head(50)
+
+master_list %>%
+  mutate(
+    churn_prob             = scales::percent(churn_prob, accuracy = 0.1),
+    p_winback              = scales::percent(p_winback, accuracy = 0.1),
+    Monetary               = scales::dollar(Monetary, big.mark = ",", prefix = ""),
+    expected_revenue_saved = scales::dollar(expected_revenue_saved, big.mark = ",", prefix = "")
+  ) %>%
+  kable(
+    caption    = "Top 50 Win-Back Priority List — Sorted by Expected Revenue Saved",
+    col.names  = c("Rank", "Customer ID", "RFM Segment", "Type",
+                   "R", "F", "M",
+                   "Churn Prob", "Risk Tier", "P(Win-Back)",
+                   "Days Inactive", "Months", "Orders", "Monetary",
+                   "Exp. Rev. Saved", "Action", "Channel", "Age Group", "Cohort")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE, font_size = 11) %>%
+  row_spec(which(master_list$risk_tier == "Critical"),
+           background = "#FADBD8")
+```
+
+---
+
+# TÓM TẮT — Trajectory 2 Narrative
+
+```{r summary-narrative, echo=FALSE}
+# Pull key numbers
+n_critical_high <- all_preds %>%
+  filter(risk_tier %in% c("High Risk", "Critical")) %>% nrow()
+
+pct_rev_at_risk <- all_preds %>%
+  mutate(rar = Monetary * churn_prob) %>%
+  summarise(pct = sum(rar) / sum(Monetary)) %>%
+  pull(pct)
+
+har_2020 <- cohort_base %>% filter(cohort_year == 2020) %>% pull(hit_and_run_rate)
+har_2025_fc <- har_forecast %>% filter(cohort_year == 2025) %>% pull(hit_and_run_rate)
+
+6562017511/sum(df_delivered$quantity*df_delivered$price)
+```
+
+**Trajectory 2 — Churn Accelerates: Tóm tắt dự báo**
+
+| KPI | Status | Dự báo (No Intervention) |
+|-----|--------|--------------------------|
+| Hit-and-Run Rate (2020) | `r scales::percent(har_2020, accuracy=0.1)` | `r scales::percent(har_2025_fc, accuracy=0.1)` (2025 cohort) |
+| High/Critical Risk Customers | `r scales::comma(n_critical_high)` | Tiếp tục tăng theo HAR trend |
+| Revenue at Risk | `r scales::percent(pct_rev_at_risk, accuracy=0.1)` of total Monetary | Tăng nếu không có win-back |
+| Median Customer Lifetime | Giảm theo cohort | Cohort mới ngắn hơn cohort cũ |
+
+**Pipeline cho Prescriptive (bước tiếp theo):**
+
+1. **Segment → Action mapping** từ Master Priority List → CRM triggers
+2. **A/B test** với intervention_params để đo actual vs simulated revenue_saved
+3. **Retrain model** với data sau can thiệp để đo churn_reduction thực tế
+4. **Feedback loop**: actual win-back rate → cập nhật `p_winback` lookup table
