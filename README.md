@@ -47,7 +47,8 @@ Mục tiêu cuối cùng là tạo ra insight kinh doanh có thể hành động
 │
 ├── datathon_mcas.py                       # File Python chính / utility script của project
 └── README.md
-```text
+
+```markdown
 
 Mô Tả Dữ Liệu
 
