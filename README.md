@@ -39,11 +39,15 @@ Mục tiêu cuối cùng là tạo ra insight kinh doanh có thể hành động
 │   └── new_merge_df_2                     # Tạo df_2: Customer Behavior
 │
 ├── Model/                                # Script huấn luyện mô hình forecasting
-│   └── train_ultimate_final.py            # Final model dự báo Revenue và COGS
+│   ├── submission_final.csv
+│   ├── time_series_cv_metrics.csv
+│   ├── time_series_cv_predictions.csv
+│   ├── lgbm_feature_importance_gain.csv
+│   ├── shap_feature_importance.csv
 │
 ├── datathon_mcas.py                       # File Python chính / utility script của project
 └── README.md
-
+```text
 
 Mô Tả Dữ Liệu
 
