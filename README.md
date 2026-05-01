@@ -17,13 +17,15 @@ Mục tiêu cuối cùng là tạo ra insight kinh doanh có thể hành động
 ## Cấu Trúc Dự Án
 
 ```text
-
-├── EDA/                                  # Jupyter notebooks cho phân tích EDA
-│   ├── EDA_inventory_returns.ipynb        # EDA về inventory và returns
-│   ├── datathon_df1_eda.py                # EDA cho df_1: Revenue & Profit
-│   ├── df_6_eda.ipynb                     # EDA cho df_6: Web Traffic → Conversion
-│   └── df_7_eda (1).ipynb                 # EDA cho df_7: Reviews & Satisfaction
-│
+├── EDA/                                      # Files phân tích EDA
+│   ├── EDA_inventory_returns.ipynb            # EDA về inventory và returns
+│   ├── Trajectory2_PredictionModel.Rmd        # File phân tích / modeling bằng R
+│   ├── df_1_eda.py                            # EDA cho df_1: Revenue & Profit
+│   ├── df_2_eda.Rmd                           # EDA cho df_2: Customer Behavior
+│   ├── df_3_eda.Rmd                           # EDA cho df_3: Promotion & Pricing
+│   ├── df_6_eda.ipynb                         # EDA cho df_6: Web Traffic → Conversion
+│   └── df_7_eda (1).ipynb                     # EDA cho df_7: Reviews & Satisfaction
+│ 
 ├── Merge_data_code/                      # Scripts merge dữ liệu theo từng trục phân tích
 │   ├── merge_3.py                         # Tạo df_3: Promotion & Pricing
 │   ├── merge_4.py                         # Tạo df_4: Delivery / Operations analysis
